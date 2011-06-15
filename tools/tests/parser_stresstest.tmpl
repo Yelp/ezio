@@ -1,0 +1,67 @@
+#extends base.foo.whatever.deeplynested.moredeeplynested
+#from foo import (bar, baz,
+# qux)
+#call self.foo['bar'].somefunc somearg=$someval, end=False, **$somedict['kwargs']
+inside the call
+#end call
+$silly.sillysilly________silly['si' + 2 * r'l' + u'''y''':sillyfuncall(*args)].silly(sillllly, silly=lambda: silly, *silly, **silly)
+#block foo_bar
+in a block
+#end block
+read past the directive, and into the "placeholder" before the $$i, I dare you!
+#for $i in $range(10)
+
+foo
+foo$bar
+baz
+#block foo
+in block foo
+#block nested
+in nested
+#block nested2
+in nested2
+#block nested3
+in nested3
+leaving nested3
+#end block nested3
+leaving nested2
+#end block nested2
+leaving nested
+#end block nested
+leaving foo
+#end block foo
+${foo}$foo${foo}$foo$foo
+#@foo
+#def bar()
+literal text in the def
+#end def
+#for $i in $range(
+#      11)
+literal text
+literaltext
+rightnexttoyou$foo($bar, r"""(""", *u"foo'bar", **$baz(qux(r"((", *')))))' u'(((' ), *quux, **quuux('''
+inside a string literal this $ is untouched
+''', *args)))rest)
+#for key, value in somefunc(foo(bar),
+#                          "baz)",
+#                          qux=qux[r"""qu
+#                          ux"""],
+#                          *u'""")(((',
+#                          **{'quuux': 'quuuux'})
+more literal text
+#end for
+less indented literal text with a literal $$ dollar sign
+
+yayayayay
+prepare for the KILLER
+$silly.sillysilly________silly['si' + 2 * r'l' + u'''y''':sillyfuncall(*args)].silly(sillllly, silly=lambda: silly, *silly, **silly)
+$silly.sillysilly________silly[$si + 2 * r'l' + u'''$y''':sillyfuncall('*$args', *'args', **$kwargs + {'$':$foo})].silly($sillllly, $silly=lambda: silly, *silly, **silly)
+$silly[$si + 2 * r'l' + u'''"""$y''':sillyfuncall('*"$args"', *'args', **$kwargs + {"'$':$foo[$bar] + ur'" : ur"""$foo"""})].silly($sillllly, $silly=lambda: silly, *silly, **silly)
+#end for
+even less indented literal text${curly_bracket}$[square_bracket]$(round_bracket)$no_bracket
+$sandwiched_escape$$${preceded_by_an_escape}
+#end for
+not indented
+#block at_EOF
+this block ends at the very end of the file!
+#end block
