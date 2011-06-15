@@ -1,0 +1,41 @@
+#!/usr/bin/env python
+
+"""
+Command-line tool to build a file or project.
+"""
+
+import optparse
+import os
+import os.path
+import sys
+
+from ezio import builder
+
+option_parser = optparse.OptionParser()
+option_parser.add_option('--gcc-only', dest='gcc_only', default=False, action='store_true', help="Recompile the existing C source file in place.")
+opts, args = option_parser.parse_args()
+assert len(args) == 1, 'Takes exactly one argument, the template file or project directory to compile.'
+
+if __name__ == '__main__':
+	option_parser = optparse.OptionParser()
+	option_parser.add_option('--gcc-only', dest='gcc_only', default=False, action='store_true', help="Recompile the existing C source file in place.")
+	opts, args = option_parser.parse_args()
+	assert len(args) == 1, 'Takes exactly one argument, the template file or project directory to compile.'
+	target = args[0]
+
+	# XXX this kind of coupling between the functions that return the C file names
+	# and the functions that actually generate those C files is annoying,
+	# but what to do, we have to expose the functionality of recompiling existing
+	# C source in place...
+	if os.path.isdir(target):
+		c_file_name = builder.project_dirname_to_c_filename(target)
+		if not opts.gcc_only:
+			print >>sys.stderr, '** .tmpl -> .c **'
+			builder.build_project(target)
+	else:
+		_, c_file_name = builder.process_filename(target)
+		if not opts.gcc_only:
+			print >>sys.stderr, '** .tmpl -> .c **'
+			builder.compile_single_file(target)
+
+	builder.buildext(c_file_name)

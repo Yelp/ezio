@@ -1,0 +1,9 @@
+<table>
+#for $row in $table
+<tr>
+#for $column in $row.values()
+<td>$column</td>
+#end for
+</tr>
+#end for
+</table>

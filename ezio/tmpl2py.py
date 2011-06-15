@@ -361,6 +361,20 @@ class CallStrategy(object):
 
         driver.advance_past(driver.head)
 
+
+class CommentStrategy(object):
+    """Substrategy for directives; "directives" beginning with #, i.e.,
+    lines beginning with ##, are one-line comments and should be ignored.
+    """
+
+    def accepts(self, string):
+        return string.startswith('#')
+
+    def consume(self, py_out, driver):
+        """Consume the entire line; don't write anything."""
+        driver.advance_past(driver.head)
+
+
 class BlockStrategy(object):
     """Handle conversion of #block.
 
@@ -396,7 +410,7 @@ class LineDirectiveSuperStrategy(object):
     substrategy, and then exits line directive mode.
     """
 
-    sub_strategies = (BlockStrategy(), CallStrategy(), ExtendsStrategy(),
+    sub_strategies = (CommentStrategy(), BlockStrategy(), CallStrategy(), ExtendsStrategy(),
             LinewisePurePythonStrategy(), EndSuiteStrategy())
 
     def accepts(self, string):

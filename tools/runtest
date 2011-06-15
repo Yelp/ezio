@@ -1,0 +1,25 @@
+#!/usr/bin/python
+
+import subprocess
+import sys
+import time
+
+testname = sys.argv[1] if len(sys.argv) > 1 else 'simple'
+
+subprocess.check_call(['bin/ezio', 'tools/templates/%s.tmpl' % testname])
+
+template_module = __import__('tools.templates.%s' % testname, globals(), locals(), [testname])
+bootstrap_module = __import__('tools.tests.%s' % testname, globals(), locals(), [testname])
+
+transaction = []
+display = bootstrap_module.display
+responder_name = "%s_respond" % testname
+responder = getattr(template_module, responder_name)
+
+start_time = time.time()
+responder(display, transaction)
+result = "".join(transaction)
+elapsed = time.time() - start_time
+
+print result
+print >>sys.stderr, "Elapsed time in milliseconds: %f" % (elapsed * 1000.0)

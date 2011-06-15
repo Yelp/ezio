@@ -1,0 +1,14 @@
+#def special_technique_of_shadowboxing($bar)
+<table>
+#for $first in $bag
+    <tr>
+    #for $second in $bag
+        <td>$bar.bat</td><td>$bar.baz.bat</td><td>$bar.bam.baz.bat</td><td>$bar.bal.bam.baz.bat</td>
+    #end for
+    </tr>
+#end for
+</table>
+#end def
+
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"  "http://www.w3.org/TR/html4/loose.dtd">
+$special_technique_of_shadowboxing($bar)

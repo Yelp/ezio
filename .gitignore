@@ -1,2 +1,9 @@
 build/
 *.py[co]
+*.sw[po]
+ezio/cheetahparser.*
+*.c
+*.cpp
+*.so
+tools/templates/*.py
+!tools/templates/__init__.py
