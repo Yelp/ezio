@@ -6,6 +6,9 @@ and then those directives control the substitution of data into the HTML. EZIO
 uses the Cheetah/Spitfire syntax, but unlike those languages, it compiles to
 Python C extension modules.
 
+Currently, EZIO is in an experimental state, and shouldn't be used in production
+or any sensitive context.
+
 The core design idea of EZIO is this: a Python templating language has to use
 the Python runtime (here, the C-API) for a few core tasks:
 
