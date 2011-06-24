@@ -1,6 +1,7 @@
 #!/usr/bin/python
 
 import testify
+from testify.assertions import assert_raises
 
 from tools.tests.test_case import EZIOTestCase
 
@@ -13,7 +14,8 @@ class TestCase(EZIOTestCase):
     def get_display(self):
         return display
 
-    # TODO define a behavior for this; for now, just assert that we don't crash
+    def test(self):
+        assert_raises(KeyError, self.run_templating)
 
 if __name__ == '__main__':
     testify.run()

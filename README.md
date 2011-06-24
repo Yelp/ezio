@@ -4,10 +4,11 @@ Architecture
 EZIO is a templating language, i.e., you write HTML with some directives in it,
 and then those directives control the substitution of data into the HTML. EZIO
 uses the Cheetah/Spitfire syntax, but unlike those languages, it compiles to
-Python C extension modules.
+Python C extension modules; the goal is to be the fastest possible templating
+language in the CPython environment.
 
 Currently, EZIO is in an experimental state, and shouldn't be used in production
-or any sensitive context.
+or in any sensitive context.
 
 The core design idea of EZIO is this: a Python templating language has to use
 the Python runtime (here, the C-API) for a few core tasks:
@@ -26,7 +27,7 @@ for variable substitution, 'transaction' is a list of strings, representing the
 pieces of the template output as the template code executes and the pieces of
 the page are assembled.
 
-Templating is implemented as appending strings to this list, at the end we call
+Templating is implemented as appending strings to this list; at the end we call
 ''.join(transaction) and the resulting string is the output. According to
 Cheetah's benchmarks, this technique outperforms a byte buffer like CStringIO,
 and also has the advantage of being unicode-agnostic at template time.
@@ -68,23 +69,17 @@ TODO
 
 These are P1 TODOs, i.e., serious obstacles to any productionization:
 
-* Fix path and name resolution to set exception data on NULL; we should never return NULL
-  from a resolution of any kind (right now this produces 'Error return without exception set')
-* We don't have if statements (but jamesd did most of the implementation in a branch)
-* We don't support kwargs in Python calls from inside the template
-* Need to wrap template classes in Python classes, rather than having respond()
+* Support if statements
+* Support Cheetah's #call statement
+* Wrap template classes in Python classes, rather than having respond()
   at module scope; we could encapsulate this within the C module or do something
   clever in Python
-* Need a modified implementation of str.join() that casts non-strings to string
-* The lexer and the parser are brittle, don't provide useful errors,
-  and don't pass through information about the original .tmpl line from which
-  a given piece of C++ code has been compiled
-* The build system requires rebuilding entire projects at once
-  (silvas notes that for developer testing, we could use a pure-Python implementation
-  of compilation that wouldn't require dependency resolution, and
-  resign ourselves to doing full builds for C++ compilation)
-* We need to support gettext (via the gettext C API)
-* We need to support HTML escaping (in a performant way)
+* Make a modified implementation of str.join() that casts non-strings to string
+* Make the lexer and the parser provide useful errors, based on the original source
+  line that caused the error
+* Fix the build system not to require rebuilding entire projects at once
+* Support gettext (via the gettext C API)
+* Support HTML escaping (in a performant way)
 
 These are P2 TODOS:
 
@@ -92,12 +87,10 @@ These are P2 TODOS:
   adds some spurious newlines due to the way it lexes bare literals)
 * Need a full evaluation of the performance hit associated with our varargs dotted path
   lookup implementation (in Ezio.h)
-* Need support for Python (or C) literals as call arguments; right now, we have function calls,
-  but the only legal arguments are dotted-path lookups within the display dict
-* Need a way to default failed lookups to the empty string, while logging errors (Cheetah
-  apparently sucks at this)
+* Need a way to default failed lookups to the empty string, while logging errors
 
 These are "future directions":
+
 * jlatt notes that we need support for custom blocks to label HTML and json content
 * Can this solution be adapted to other kinds of template language?
 
@@ -127,5 +120,7 @@ Credits
 EZIO is a Yelp engineering project by:
 
 Shivaram Lingamneni <shivaram@yelp.com>
+
 James Duncan <jamesd@yelp.com>
+
 Sean Silva <silvas@purdue.edu>

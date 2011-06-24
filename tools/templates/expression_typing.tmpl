@@ -1,0 +1,10 @@
+$is_int(3)
+$is_int(548382)
+## sys.maxint + 1
+$is_long(9223372036854775808)
+## shouldn't be confused by the existence of an int-typed 3
+$is_float(3.0)
+$is_float(2.71828)
+$is_str('innocuous string')
+$is_unicode(u'hommage à jack')
+hommage à jack

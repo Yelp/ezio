@@ -155,7 +155,7 @@ def build_project(project_dir):
     classname_to_def = {}
     compiled_classes = []
 
-    literal_registry = path_registry = import_registry = None
+    literal_registry = path_registry = import_registry = expression_registry = None
 
     for classname in build_order:
         filename = classname + '.tmpl'
@@ -174,8 +174,10 @@ def build_project(project_dir):
         literal_registry = class_generator.registry
         path_registry = class_generator.path_registry
         import_registry = class_generator.import_registry
+        expression_registry = class_generator.expression_registry
 
-    c_file_code = generate_c_file(MODULE_NAME, literal_registry, path_registry, import_registry, compiled_classes)
+    c_file_code = generate_c_file(MODULE_NAME, literal_registry, path_registry,
+            import_registry, expression_registry, compiled_classes)
     c_file_name = project_dirname_to_c_filename(project_dir)
     with open(c_file_name, 'w') as outfile:
         outfile.write(c_file_code)

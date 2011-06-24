@@ -5,8 +5,9 @@ C extension modules.
 from __future__ import with_statement
 
 import _ast
+import copy
 import itertools
-import operator
+import sys
 from contextlib import contextmanager
 
 from ezio.astutil.node_visitor import NodeVisitor
@@ -16,6 +17,8 @@ DISPLAY_NAME = "display"
 TRANSACTION_NAME = "transaction"
 LITERALS_ARRAY_NAME = "string_literals"
 IMPORT_ARRAY_NAME = 'imported_names'
+EXPRESSIONS_ARRAY_NAME = 'expressions'
+EXPRESSIONS_EXCEPTION_HANDLER = 'HANDLE_EXCEPTIONS_EXPRESSIONS'
 MAIN_FUNCTION_NAME = "respond"
 TERMINAL_EXCEPTION_HANDLER = "REPORT_EXCEPTION_TO_PYTHON"
 
@@ -66,43 +69,127 @@ class LineBufferMixin(object):
         self.indent -= increment
 
 
-class LiteralRegistry(object):
-    """Encapsulates the creation of Python string objects for all string literals
-    that appear in the template.
+class LiteralRegistry(LineBufferMixin):
+    """Encapsulates the creation of Python string/int/bool objects for templating.
+
+    Some use cases: string literals in the template, integers used as constant arguments.
     """
 
     def __init__(self):
+        super(LiteralRegistry, self).__init__()
         self.literals = []
-        self.literal_to_index = {}
+        self.literal_key_to_index = {}
+
+        self.dispatch_map = {
+            'int': self.generate_int,
+            'float': self.generate_float,
+            'str': self.generate_str,
+        }
+
+    def _canonicalize_type(self, value):
+        """Basically, distinguish 3 from 3.0 (since they're ==) by tagging them with int/float."""
+        val_type = type(value)
+        if val_type in (int, long):
+            return 'int'
+        elif val_type == float:
+            return 'float'
+        elif val_type in (str, unicode):
+            return 'str'
+        else:
+            raise Exception("Can't create literals for type %r" % (val_type,))
+
+    def _value_to_key(self, value):
+        """Hashable key uniquely identifying a value, by including the type."""
+        return (self._canonicalize_type(value), value)
+
+    def generate_float(self, value):
+        return "PyFloat_FromDouble(%r)" % (value,)
+
+    def generate_int(self, value):
+        # XXX assume that (sys.maxint at compile-time) == (sys.maxint at runtime)
+        if value >= (-1*sys.maxint - 1) and value <= sys.maxint:
+            return "PyInt_FromLong(%r)" % (value,)
+        else:
+            # just have it decode the base-10 representation
+            return 'PyLong_FromString("%r", NULL, 10)' % (value,)
+
+    def generate_str(self, value):
+        # http://stackoverflow.com/questions/4000678/using-python-to-generate-a-c-string-literal-of-json
+        formatted_value = '"' + value.replace('\\', r'\\').replace('"', r'\"').replace("\n", r'\n') + '"'
+        if isinstance(formatted_value, str):
+            return "PyString_FromString(%s)" % (formatted_value,)
+        elif isinstance(formatted_value, unicode):
+            return "PyUnicode_FromString(%s)" % (formatted_value.encode('utf-8'),)
+        else:
+            raise ValueError(type(formatted_value))
 
     def register(self, literal):
-        index = self.literal_to_index.get(literal)
+        """Intern `literal` and return its index in the intern table."""
+        key = self._value_to_key(literal)
+        index = self.literal_key_to_index.get(key)
         if index is not None:
             return index
 
         self.literals.append(literal)
         index = len(self.literals) - 1
-        self.literal_to_index[literal] = index
+        self.literal_key_to_index[key] = index
         return index
 
+    def cexpr_for_index(self, index):
+        """Return a C expression to access the literal at `index`."""
+        return "%s[%d]" % (LITERALS_ARRAY_NAME, index)
+
     def dump(self):
+        self.add_line("static PyObject *%s[%d];" % (LITERALS_ARRAY_NAME, len(self.literals)))
+        self.add_line("static void init_string_literals(void) {")
+        with self.increased_indent():
+            for pos, literal in enumerate(self.literals):
+                canonical_type = self._canonicalize_type(literal)
+                cexpr_for_literal = self.dispatch_map[canonical_type](literal)
+                self.add_line("%s[%d] = %s;" % (LITERALS_ARRAY_NAME, pos, cexpr_for_literal))
+        self.add_line("}")
+        return self.lines
+
+class ExpressionRegistry(LineBufferMixin):
+    """Encapsulates static creation of Python objects that cannot necessarily be uniqued,
+    or created by means of a simple C expression; core use case is default arguments.
+    """
+
+    def __init__(self):
+        super(ExpressionRegistry, self).__init__()
+        self.num_objects = 0
+        self.lvalue_to_resolver = {}
+
+    def register(self):
+        """Get an lvalue that you can assign the evaluation of a desired expression to.
+
+        Note that this is different from other registries, in that the client has to
+        generate and pass in its own expression-evaluating code.
         """
-        http://stackoverflow.com/questions/4000678/using-python-to-generate-a-c-string-literal-of-json
-        """
-        pieces = ["static PyObject *%s[%d];" % (LITERALS_ARRAY_NAME, len(self.literals))]
-        pieces.append("static void init_string_literals(void) {")
-        for pos, literal in enumerate(self.literals):
-            formatted_literal = '"' + literal.replace('\\', r'\\').replace('"', r'\"').replace("\n", r'\n') + '"'
-            pieces.append("\t%s[%d] = PyString_FromString(%s);" % (LITERALS_ARRAY_NAME, pos, formatted_literal))
-        pieces.append("}")
-        pieces.append("static void destroy_string_literals(void) {")
-        pieces.append("\tPy_ssize_t i;")
-        pieces.append("\tfor (i = 0; i < %d; i++) {" % len(self.literals))
-        pieces.append("\t\tPy_DECREF(%s[i]);" % LITERALS_ARRAY_NAME)
-        pieces.append("\t}")
-        pieces.append("}")
-        #return '\n'.join(pieces)
-        return pieces
+        result = "%s[%d]" % (EXPRESSIONS_ARRAY_NAME, self.num_objects)
+        self.num_objects += 1
+        return result
+
+    def set_expression_resolver(self, lvalue, resolving_code):
+        """Set C++ code that will perform assignment for a given lvalue."""
+        self.lvalue_to_resolver[lvalue] = resolving_code
+
+    def dump(self):
+        self.add_line("static PyObject *%s[%d];" % \
+            (EXPRESSIONS_ARRAY_NAME, len(self.lvalue_to_resolver)))
+        self.add_line("static void init_expressions(void) {")
+        with self.increased_indent():
+            for resolver in self.lvalue_to_resolver.itervalues():
+                self.add_line(resolver)
+            # XXX this exception handler is a no-op; if an exception
+            # has been set during the execution of the resolvers,
+            # it'll get picked up as soon as we return from our
+            # PyMODINIT_FUNC bootstrap. So this handler doesn't have
+            # to do anything, it's just a convenience so the CodeGenerator
+            # can always have an exception handler label available to it.
+            self.add_line("%s:;" % (EXPRESSIONS_EXCEPTION_HANDLER,))
+        self.add_line("}")
+        return self.lines
 
 class ImportRegistry(object):
     """Encapsulates tracking of imported names, and the code to perform the imports."""
@@ -236,6 +323,9 @@ class PathRegistry(LineBufferMixin):
             self.add_line("}")
         return self.lines
 
+def extract_params_with_defaults(args):
+    num_required_args = len(args.args) - len(args.defaults)
+    return args.args[num_required_args:]
 
 def positional_args_and_self_arg(args):
     """Divide positional parameters for a method into "self" and the actual positional params.
@@ -247,7 +337,6 @@ def positional_args_and_self_arg(args):
     assert len(args.args) > 0, 'Method has no self argument.'
     self_arg = args.args[0].id
     return [arg.id for arg in args.args[1:]], self_arg
-
 
 class ClassDefinition(LineBufferMixin):
     """Encapsulates a definition of a class.
@@ -288,7 +377,7 @@ class ClassDefinition(LineBufferMixin):
     def has_method(self, method_name):
         return self.get_method(method_name) is not None
 
-    def add_method(self, method, params):
+    def add_method(self, method, params, defaults=()):
         assert method == MAIN_FUNCTION_NAME or method not in RESERVED_WORDS, 'Method name %s is a reserved word' % method
         assert method not in self.methods, 'Cannot double-define method %s for class %s' % (method, self.class_name)
 
@@ -297,12 +386,14 @@ class ClassDefinition(LineBufferMixin):
             superclass_method = self.superclass_def.get_method(method)
         if superclass_method is not None:
             assert len(superclass_method['params']) == len(params), 'Incompatible superclass definition'
+            assert len(superclass_method['defaults']) == len(defaults), 'Incompatible superclass definition'
             superclass_method['virtual'] = True
 
         # OK, this is the first place in the hierarchy that this method has been defined:
         self.methods[method] = {
             'name': method,
             'params': params,
+            'defaults': defaults,
             'virtual': False
         }
 
@@ -367,6 +458,7 @@ def generate_final_segment(module_name, function_names):
     buf.add_line('Py_InitModule("%s", k_module_methods);' % module_name)
     buf.add_line('init_string_literals();')
     buf.add_line('init_imports();')
+    buf.add_line('init_expressions();')
     buf.indent -= 1
     buf.add_line('}')
     buf.add_line('')
@@ -403,7 +495,7 @@ def generate_hook(function_name, class_name):
     return buf.lines
 
 
-def generate_c_file(module_name, literal_registry, path_registry, import_registry, compiled_classes):
+def generate_c_file(module_name, literal_registry, path_registry, import_registry, expression_registry, compiled_classes):
     """Generate a complete C++ source file; string literals, path lookup functions,
     imports, all code for all classes, hooks, final segment.
     """
@@ -413,6 +505,7 @@ def generate_c_file(module_name, literal_registry, path_registry, import_registr
     all_lines += literal_registry.dump()
     all_lines += path_registry.dump() if path_registry is not None else []
     all_lines += import_registry.dump()
+    all_lines += expression_registry.dump()
 
     # concatenate all class definitions and their method definitions
     hook_names = []
@@ -454,8 +547,9 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
     to fall all the way down the call stack and back into Python.
     """
 
-    def __init__(self, class_definition=None, literal_registry=None, path_registry=None, import_registry=None, compiler_settings=None,
-            unique_id_counter=None, superclass_definition=None):
+    def __init__(self, class_definition=None, literal_registry=None, path_registry=None,
+            import_registry=None, compiler_settings=None, unique_id_counter=None,
+            superclass_definition=None, expression_registry=None):
         super(CodeGenerator, self).__init__()
 
         # this one can stay null if we don't have one already;
@@ -470,6 +564,7 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         self.import_registry = ImportRegistry() if import_registry is None else import_registry
         self.compiler_settings = CompilerSettings() if compiler_settings is None else compiler_settings
         self.unique_id_counter = itertools.count() if unique_id_counter is None else unique_id_counter
+        self.expression_registry = ExpressionRegistry() if expression_registry is None else expression_registry
 
         self.lines = []
 
@@ -484,6 +579,13 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         # until finally you return a null pointer back to the Python calling code
         self.exception_handler_stack = []
 
+    def make_subgenerator(self):
+        return CodeGenerator(class_definition=self.class_definition,
+            literal_registry=self.registry, path_registry=self.path_registry,
+            import_registry=self.import_registry, compiler_settings=copy.copy(self.compiler_settings),
+            unique_id_counter=self.unique_id_counter, superclass_definition=self.superclass_definition,
+            expression_registry=self.expression_registry)
+
     def visit_Module(self, module_node, variable_name=None):
         assert variable_name is None, 'Cannot compile module for assignment.'
 
@@ -497,6 +599,7 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         (since our pipeline converts .tmpl files into Python
         modules containing a single class).
         """
+        assert not variable_name, 'Classes are not expressions'
         # we have to get all the classes and t-sort them by inheritance at build time,
         # otherwise we'll have no idea how to compile invocations, because we won't know if
         # the function being called is an inherited native method or a Python callable from
@@ -521,9 +624,10 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         for function in function_definitions:
             # .args is all arguments, .args.args is the positional params:
             param_names, _ = positional_args_and_self_arg(function.args)
+            default_names = frozenset(param.id for param in extract_params_with_defaults(function.args))
             # skip the definition of the main method, if this is a subclass:
             if function.name != MAIN_FUNCTION_NAME or write_toplevel_entities:
-                self.class_definition.add_method(function.name, param_names)
+                self.class_definition.add_method(function.name, param_names, default_names)
 
         for stmt in class_node.body:
             assert isinstance(stmt, _ast.FunctionDef), 'Cannot compile non-method elements of classes.'
@@ -532,23 +636,43 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
                 self.visit_FunctionDef(stmt, method=True)
 
     def visit_Expr(self, expr, variable_name=None):
-        """Expr is a statement for a bare expression, wrapping the expression as  .value."""
+        """Expr is a statement for a bare expression, wrapping the expression as .value."""
         return self.visit(expr.value, variable_name=variable_name)
 
     def visit_Str(self, str_node, variable_name=None):
         # value of a string literal is the member 's'
-        index = self.registry.register(str_node.s)
-        literal_reference = "%s[%d]" % (LITERALS_ARRAY_NAME, index)
+        return self._visit_literal(str_node.s, variable_name=variable_name)
+
+    def visit_Num(self, num_node, variable_name=None):
+        # value of a numeric literal is the member 'n'
+        return self._visit_literal(num_node.n, variable_name=variable_name)
+
+    def _visit_literal(self, value, variable_name=None):
+        index = self.registry.register(value)
+        literal_reference = self.registry.cexpr_for_index(index)
         if variable_name:
             # return a borrowed reference:
             self.add_line("%s = %s;" % (variable_name, literal_reference))
             return False
         elif self.compiler_settings.template_mode:
-            self._template_write(literal_reference, test_null=False)
+            self._template_write(literal_reference)
 
     def visit_FunctionDef(self, function_def, method=False):
         argslist_str, arg_namespace = self._generate_argslist_for_declaration(function_def.args, method=method)
         self.add_line("PyObject* %s::%s(%s) {" % (self.class_definition.class_name, function_def.name, argslist_str))
+        self.indent += 1
+
+        params_with_defaults = extract_params_with_defaults(function_def.args)
+        for param, default_expr in zip(params_with_defaults, function_def.args.defaults):
+            # compile code to generate the default value:
+            subgenerator = self.make_subgenerator()
+            subgenerator.compiler_settings.template_mode = False
+            subgenerator.exception_handler_stack.append(EXPRESSIONS_EXCEPTION_HANDLER)
+            expression_lvalue = self.expression_registry.register()
+            subgenerator.visit(default_expr, variable_name=expression_lvalue)
+            self.expression_registry.set_expression_resolver(expression_lvalue,
+                '\n'.join(subgenerator.lines))
+            self.add_line('if (%s == NULL) { %s = %s; }' % (param.id, param.id, expression_lvalue))
 
         # this would only be possible if function defs were nested:
         assert len(self.exception_handler_stack) == 0
@@ -556,7 +680,6 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         self.exception_handler_stack.append(exception_handler)
 
         self.namespaces.append(arg_namespace)
-        self.indent += 1
         for stmt in function_def.body:
             self.visit(stmt)
         # XXX Py_None is being used as a C-truthy sentinel for success
@@ -570,12 +693,14 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         self.exception_handler_stack.pop()
 
     def _generate_argslist_for_declaration(self, args, method=False):
-        """Returns both the generated code and a
-        namespace dict for the defined arguments.
+        """Set up arguments for a native method declaration.
+
+        Returns: comma_separated_argnames, a namespace dictionary for the arguments
         """
         # args has members "args", "defaults", "kwarg", "vararg";
-        # the first of these is the positional parameters and that's what we care about
-        assert not any ((args.defaults, args.kwarg, args.vararg)), "Kwargs/varargs currently unsupported"
+        # the first of these is the positional parameters (including those with defaults),
+        # "kwarg" and "vararg" refer to ** and * parameters respectively.
+        assert not any ((args.kwarg, args.vararg)), "Kwargs/varargs currently unsupported"
 
         if method:
             positional_args, self_arg = positional_args_and_self_arg(args)
@@ -593,31 +718,264 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
             namespace[self_arg] = 'SELF'
         return argslist_str, namespace
 
-    def _generate_argslist_for_invocation(self, args, unique_id, exception_handler):
-        """Generate C expressions and temporary variables for all the arguments to the invocation."""
-        # skip over annoying edge cases when there are no args:
-        if not args:
-            return []
+    def _generate_argslist_for_invocation(self, call_node, c_method):
+        """Generate C expressions and temporary variables for the arguments to an invocation.
+
+        This helper function is applicable to native methods and Python calls without keywords,
+        and it knows how to turn missing keyword arguments for a native method into NULLs.
+
+        Returns: a list of pairs (var_name, new_ref), where var_name is the name of
+            the argument (or 'NULL') and new_ref is whether a new reference was created for it
+        """
+
+        if c_method:
+            remaining_params = list(c_method['params'])
+            used_params = set()
+
+            tempvars_and_exprs = []
+            # apply the positional params to the function's params, in order:
+            assert len(call_node.args) <= len(remaining_params), 'Too many arguments'
+            for param, arg in zip(remaining_params, call_node.args):
+                tempvars_and_exprs.append((self._make_tempvar(), arg))
+                used_params.add(param)
+
+            # leftover function params must be satisfied from the kwargs:
+            remaining_params = remaining_params[len(call_node.args):]
+            param_to_kwarg = dict((keyword.arg, keyword.value) for keyword in call_node.keywords)
+            for param in remaining_params:
+                kwarg_expr = param_to_kwarg.get(param)
+                if kwarg_expr is None:
+                    assert param in c_method['defaults'], 'Param %s has no default argument' % (param,)
+                    tempvars_and_exprs.append(('NULL', None))
+                else:
+                    tempvars_and_exprs.append((self._make_tempvar(), kwarg_expr))
+                    param_to_kwarg.pop(param)
+                used_params.add(param)
+
+            # all kwargs should have been consumed
+            if param_to_kwarg:
+                bad_param = param_to_kwarg.keys()[0]
+                if bad_param in used_params:
+                    raise Exception('Double-definition of param %s' % (bad_param,))
+                else:
+                    raise Exception('Undefined kwarg %s' % (bad_param,))
+        else:
+            assert not call_node.keywords # should be on the other code path
+            # simple case where we just evaluate all the tempvars in order
+            tempvars_and_exprs = [(self._make_tempvar(), arg) for arg in call_node.args]
 
         # generate names and declarations for the variables that will hold the invocation arguments
-        args_tempvars = ["tempvar_%d_%d" % (unique_id, i) for i in xrange(len(args))]
-        argslist_declarations = ", ".join('*%s' % varname for varname in args_tempvars)
-        self.add_line("PyObject %s = NULL;" % (argslist_declarations,))
+        args_tempvars = [tempvar for (tempvar, expr) in tempvars_and_exprs if expr is not None]
+        self._declare_and_initialize(args_tempvars)
 
+        # evaluate every argument; failures during evaluation will pass control
+        # to self.exception_handler_stack[-1], i.e., the exception handler of
+        # the visit_Call
         tempvars_and_newrefs = []
-        for tempvar, expr in zip(args_tempvars, args):
-            new_ref = self.visit(expr, variable_name=tempvar)
-            tempvars_and_newrefs.append((tempvar, new_ref))
-
-        # eagerly evaluate every argument, then fail if any did not evaluate correctly
-        # TODO do something about all these unused labels...
-        all_tempvars_nonnull = " && ".join(args_tempvars)
-        # attempt a decref on every argument that would have created a new reference,
-        # had it been successfully evaluated (unsuccessful evaluation yields simply a null pointer):
-        cleanup_all_tempvars = " ".join("Py_XDECREF(%s);" % (tempvar,) for tempvar, newref in tempvars_and_newrefs if newref)
-        self.add_line("if (!(%s)) { %s; goto %s; }" % (all_tempvars_nonnull, cleanup_all_tempvars, exception_handler))
+        for tempvar, expr in tempvars_and_exprs:
+            if expr is not None:
+                new_ref = self.visit(expr, variable_name=tempvar)
+                tempvars_and_newrefs.append((tempvar, new_ref))
+            else:
+                # notify visit_Call that it should pass the NULL pointer here:
+                tempvars_and_newrefs.append((tempvar, None))
 
         return tempvars_and_newrefs
+
+    def _generate_argstuple_and_kwdict_for_invocation(self, call_node):
+        """Helper to create the PyTuple/PyDict packing of arguments for PyObject_Call.
+
+        For the tempvars_and_newrefs value that's returned, see _generate_argslist_for_invocation.
+        """
+        args_tempvars = [self._make_tempvar() for _ in call_node.args]
+        kwargs_tempvars = [self._make_tempvar() for _ in call_node.keywords]
+        arg_tuple_tempvar = self._make_tempvar()
+        kwargs_dict_tempvar = self._make_tempvar()
+        self._declare_and_initialize(args_tempvars + kwargs_tempvars + \
+            [arg_tuple_tempvar, kwargs_dict_tempvar])
+
+        tempvars_and_newrefs = []
+        for tempvar, arg in zip(args_tempvars, call_node.args):
+            new_ref = self.visit(arg, variable_name=tempvar)
+            tempvars_and_newrefs.append((tempvar, new_ref))
+
+        tempvar_to_keyword_idx = {}
+        for tempvar, keyword in zip(kwargs_tempvars, call_node.keywords):
+            new_ref = self.visit(keyword.value, variable_name=tempvar)
+            tempvars_and_newrefs.append((tempvar, new_ref))
+            tempvar_to_keyword_idx[tempvar] = self.registry.register(keyword.arg)
+
+        packed_tempvars = '' if len(args_tempvars) == 0 else ' ,' + ', '.join(args_tempvars)
+        self.add_line("%s = PyTuple_Pack(%d%s);" %
+            (arg_tuple_tempvar, len(args_tempvars), packed_tempvars))
+        self.add_line("if (!%s) { goto %s; }" %
+                (arg_tuple_tempvar, self.exception_handler_stack[-1]))
+        self.add_line("%s = PyDict_New();" % (kwargs_dict_tempvar,))
+        self.add_line("if (!%s) { goto %s; }" % (kwargs_dict_tempvar, self.exception_handler_stack[-1]))
+        for tempvar, keyword_idx in tempvar_to_keyword_idx.iteritems():
+            self.add_line("if (PyDict_SetItem(%s, %s, %s) < 0) { goto %s; }" % (
+                    kwargs_dict_tempvar,
+                    self.registry.cexpr_for_index(keyword_idx),
+                    tempvar,
+                    self.exception_handler_stack[-1],
+                ))
+
+        return arg_tuple_tempvar, kwargs_dict_tempvar, tempvars_and_newrefs
+
+    def _declare_and_initialize(self, varnames):
+        """Declare a group of PyObject* variables and initialize them to NULL."""
+        if varnames:
+            declarations = ", ".join('*%s' % varname for varname in varnames)
+            self.add_line("PyObject %s = NULL;" % (declarations,))
+
+    def visit_Call(self, call_node, variable_name=None):
+        """Compile a function invocation.
+
+        It is known at compile time whether the function being called is native (i.e.,
+        defined in a template and compiled to C++) or Python (i.e., a callable Python
+        object from an import, a built-in, or the display dictionary). There are
+        three distinct cases: native, Python with only positional args, and Python
+        with keyword args.
+        """
+        # positional params are in call_node.args, all else is unsupported:
+        assert not any((call_node.starargs, call_node.kwargs)), 'Unsupported feature'
+
+        function_name = None
+        c_method = None
+        # a c function is a bare name that appears in the current class definition as a method:
+        if isinstance(call_node.func, _ast.Name):
+            function_name = call_node.func.id
+            c_method = self.class_definition.get_method(function_name)
+
+        if not c_method and call_node.keywords:
+            return self._visit_Call_dynamic_kwargs(call_node, variable_name=variable_name)
+
+        unique_id = self.unique_id_counter.next()
+        exception_handler = "HANDLE_EXCEPTIONS_%d" % unique_id
+        self.exception_handler_stack.append(exception_handler)
+        # create block scope for temporary variables:
+        self.add_line('{')
+
+        # python callables have a callable object and a return value, create temp vars for these
+        result_name = None
+        if not c_method:
+            temp_callable_name = "tempcallablevar_%d" % unique_id
+            self.add_line('PyObject *%s;' % temp_callable_name)
+
+            # were we given an externally scoped C variable to put the result in?
+            if variable_name:
+                result_name = variable_name
+            else:
+                result_name = "tempresultvar_%d" % unique_id
+                self.add_line('PyObject *%s;' % result_name)
+
+        argname_and_newrefs = self._generate_argslist_for_invocation(call_node, c_method)
+        args_tempvars = [argname for argname, _ in argname_and_newrefs]
+
+        if c_method:
+            # this is a C function, which we will invoke and which will modify
+            # transaction in-place rather than returning a value
+            # TODO there may be some use case for C functions that return values...
+            assert not variable_name, '%s is a C function, at this time C functions do not return values' % function_name
+            # generate code that invokes the C function and checks the result for truth
+            self.add_line("if (!this->%s(%s)) {" % (function_name, ', '.join(args_tempvars)))
+            self.indent += 1
+            self.add_line("goto %s;" % exception_handler)
+            self.indent -= 1
+            self.add_line("}")
+        else:
+            # evaluate call_node.func as a Python expr
+            new_ref_to_callable = self.visit(call_node.func, variable_name=temp_callable_name)
+            self.add_line("if (%s == NULL) { goto %s; }" % (temp_callable_name, exception_handler))
+            # now dispatch to it; NULL is the sentinel value to stop reading the arguments:
+            packed_args = ', '.join(args_tempvars) + (', NULL' if args_tempvars else ' NULL')
+            self.add_line("%s = PyObject_CallFunctionObjArgs(%s, %s);" %
+                (result_name, temp_callable_name, packed_args))
+            self.add_line("if (%s == NULL) { goto %s; }" % (result_name, exception_handler))
+            if not variable_name:
+                self._template_write(result_name)
+                # dispose of the extra ref
+                self.add_line("Py_DECREF(%s);" % (result_name,))
+
+        # clean up our owned references to the arguments if appropriate
+        # if this isn't a C function and write=True, the new reference to the resulting element
+        # gets stolen by the list (PyList_Append); if write=False, it's the caller's responsibility
+        # to clean it up
+        for (arg, newref) in argname_and_newrefs:
+            if newref:
+                self.add_line("Py_DECREF(%s);" % arg)
+        if not c_method and new_ref_to_callable:
+            self.add_line("Py_DECREF(%s);" % temp_callable_name)
+
+        self.exception_handler_stack.pop()
+
+        self.add_line("if (0) {")
+        self.indent += 1
+        self.add_line("%s:" % exception_handler)
+        for (argname, newref) in argname_and_newrefs:
+            if newref:
+                self.add_line("Py_XDECREF(%s);" % (argname,))
+        if not c_method:
+            self.add_line("Py_XDECREF(%s);" % temp_callable_name)
+        self.add_line("goto %s;" % self.exception_handler_stack[-1])
+        self.indent -= 1
+        self.add_line("}")
+
+        # close block scope
+        self.add_line('}')
+
+        # python convention is that function call always returns a new ref:
+        if variable_name:
+            return True
+
+    def _visit_Call_dynamic_kwargs(self, call_node, variable_name=None):
+        """Special case for Call, when a dictionary has to be allocated.
+
+        This is only necessary when the callable is a Python object, not native code,
+        and the call has keyword parameters. This code does exception handling a little
+        differently; the exception handling label points to "cleanup" code that executes
+        in both exceptional and non-exceptional cases, then the exception condition is
+        tested again to see whether a jump to an underlying exception handler is required,
+        or whether we can proceed.
+        """
+        with self.block_scope():
+            unique_id = self.unique_id_counter.next()
+            cleanup_label = "CLEANUP_%d" % unique_id
+            self.exception_handler_stack.append(cleanup_label)
+            temp_callable_name = "tempcallablevar_%d" % unique_id
+            self.add_line('PyObject *%s = NULL;' % temp_callable_name)
+
+            # were we given an externally scoped C variable to put the result in?
+            if variable_name:
+                result_name = variable_name
+            else:
+                result_name = "tempresultvar_%d" % unique_id
+                self.add_line('PyObject *%s;' % result_name)
+
+            argtuple, kwargdict, tempvars_and_newrefs = self._generate_argstuple_and_kwdict_for_invocation(call_node)
+
+            new_ref_to_callable = self.visit(call_node.func, variable_name=temp_callable_name)
+            self.add_line("%s = PyObject_Call(%s, %s, %s);" %
+                (result_name, temp_callable_name, argtuple, kwargdict))
+            self.add_line("if (%s == NULL) { goto %s; }" % (result_name, cleanup_label))
+            if not variable_name:
+                self._template_write(result_name)
+                # dispose of the extra ref
+                self.add_line("Py_DECREF(%s);" % (result_name,))
+
+            self.exception_handler_stack.pop()
+            self.add_line("%s:" % (cleanup_label,))
+            self.add_line("Py_XDECREF(%s); Py_XDECREF(%s);" % (argtuple, kwargdict))
+            if new_ref_to_callable:
+                self.add_line("Py_XDECREF(%s);" % (temp_callable_name,))
+            self.add_line(" ".join("Py_XDECREF(%s);" % (tempvar,)
+                for tempvar, newref in tempvars_and_newrefs if newref))
+            success_condition = " && ".join((argtuple, kwargdict, temp_callable_name, result_name))
+            self.add_line("if (!(%s)) { goto %s; }" %
+                (success_condition, self.exception_handler_stack[-1]))
+
+        if variable_name:
+            return True
 
     def visit_For(self, forloop, variable_name=None):
         """Compile a for loop, block-scoped.
@@ -646,18 +1004,20 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         length_name = "temp_sequence_length_%d" % unique_id
         self.add_line("Py_ssize_t %s;" % length_name)
 
+        self.exception_handler_stack.append(outer_exception_handler)
         new_ref_created_for_iterable = self.visit(forloop.iter, variable_name=temp_sequence_name)
-
-        self.add_line('if (!(%s)) { goto %s; }' % (temp_sequence_name, outer_exception_handler))
-        self.add_line('if (!(%s = PySequence_Fast(%s, "Not a sequence."))) { goto %s; };' % (temp_fast_sequence_name, temp_sequence_name, outer_exception_handler))
+        self.add_line('if (!(%s = PySequence_Fast(%s, "Not a sequence."))) { goto %s; };' %
+            (temp_fast_sequence_name, temp_sequence_name, outer_exception_handler))
         length_name = "temp_sequence_length_%d" % unique_id
         self.add_line("%s = PySequence_Fast_GET_SIZE(%s);" % (length_name, temp_fast_sequence_name))
         counter_name = 'counter_%d' % unique_id
         self.add_line("Py_ssize_t %s;" % counter_name)
-        self.add_line("for(%(counter)s = 0; %(counter)s < %(length)s; %(counter)s++) {" % {'counter': counter_name, 'length': length_name})
+        self.add_line("for(%(counter)s = 0; %(counter)s < %(length)s; %(counter)s++) {" %
+            {'counter': counter_name, 'length': length_name})
 
         self.indent += 1
-        self.add_line("PyObject *%s = PySequence_Fast_GET_ITEM(%s, %s);" % (var_name, temp_fast_sequence_name, counter_name))
+        self.add_line("PyObject *%s = PySequence_Fast_GET_ITEM(%s, %s);" %
+            (var_name, temp_fast_sequence_name, counter_name))
         self.add_line("if (!%s) { goto %s; }" % (var_name, outer_exception_handler))
         # GET_ITEM borrowed a reference, let's incref this thing while we're using it
         self.add_line("Py_INCREF(%s);" % var_name)
@@ -688,6 +1048,9 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         self.indent -= 1
         self.add_line("}")
 
+        # remove the outer_exception_handler from the stack:
+        self.exception_handler_stack.pop()
+
         # NON-exceptional path; deterministically decref and skip the exception handlers
         if new_ref_created_for_iterable:
             self.add_line("Py_DECREF(%s);" % (temp_sequence_name,))
@@ -707,106 +1070,6 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         # close the block scope
         self.add_line('}')
 
-    def visit_Call(self, call_node, variable_name=None):
-        """This is like generate_path; with write=True it generates code to do the invocation
-        and append the result to the transaction, with write=False it generates code to do
-        the invocation and returns (in Python) a C expression for the result.
-
-        Here's the convention for write=False; if you call a codegen method with write=False,
-        it will dump out a bunch of "setup" code (e.g., resolving a path, whatever), then return
-        a C expression for the value you want; the value will be INCREF'ed if appropriate,
-        and if it is, it's up to you to get it DECREF'ed.
-
-        Note that it is known at compile time whether the function being invoked is a Python callable
-        or a C function.
-        """
-        # positional params are in call_node.args, all else is unsupported:
-        assert not any((call_node.keywords, call_node.starargs, call_node.kwargs)), 'Unsupported feature'
-
-        unique_id = self.unique_id_counter.next()
-
-        exception_handler = "HANDLE_EXCEPTIONS_%d" % unique_id
-
-        # create block scope for temporary variables:
-        self.add_line('{')
-
-        function_name = None
-        c_function = False
-        # a c function is a bare name that appears in the current class definition as a method:
-        if isinstance(call_node.func, _ast.Name):
-            function_name = call_node.func.id
-            c_function = self.class_definition.has_method(function_name)
-        # python callables have a callable object and a return value, create temp vars for these
-        result_name = None
-        if not c_function:
-            temp_callable_name = "tempcallablevar_%d" % unique_id
-            self.add_line('PyObject *%s;' % temp_callable_name)
-
-            # were we given an externally scoped C variable to put the result in?
-            if variable_name:
-                result_name = variable_name
-            else:
-                result_name = "tempresultvar_%d" % unique_id
-                self.add_line('PyObject *%s;' % result_name)
-
-        # we've got new references to all the arguments, so create temp vars for them:
-        argname_and_newrefs = self._generate_argslist_for_invocation(call_node.args, unique_id, exception_handler)
-        args_tempvars = [argname for argname, _ in argname_and_newrefs]
-
-        if c_function:
-            # this is a C function, which we will invoke and which will modify
-            # transaction in-place rather than returning a value
-            # TODO there may be some use case for C functions that return values...
-            assert not variable_name, '%s is a C function, at this time C functions do not return values' % function_name
-            # generate code that invokes the C function and checks the result for truth
-            self.add_line("if (!this->%s(%s)) {" % (function_name, ', '.join(args_tempvars)))
-            self.indent += 1
-            self.add_line("goto %s;" % exception_handler)
-            self.indent -= 1
-            self.add_line("}")
-        else:
-            # evaluate call_node.func as a Python expr
-            new_ref_to_callable = self.visit(call_node.func, variable_name=temp_callable_name)
-            self.add_line("if (%s == NULL) { goto %s; }" % (temp_callable_name, exception_handler))
-            # now dispatch to it; NULL is the sentinel value to stop reading the arguments:
-            packed_args = ', '.join(args_tempvars) + (', NULL' if args_tempvars else ' NULL')
-            self.add_line("%s = PyObject_CallFunctionObjArgs(%s, %s);" %
-                (result_name, temp_callable_name, packed_args))
-            self.add_line("if (%s == NULL) { goto %s; }" % (result_name, exception_handler))
-            if not variable_name:
-                self._template_write(result_name, test_null=False)
-                # dispose of the extra ref
-                self.add_line("Py_DECREF(%s);" % (result_name,))
-
-        # clean up our owned references to the arguments if appropriate
-        # if this isn't a C function and write=True, the new reference to the resulting element
-        # gets stolen by the list (PyList_Append); if write=False, it's the caller's responsibility
-        # to clean it up
-        for (arg, newref) in argname_and_newrefs:
-            if newref:
-                self.add_line("Py_DECREF(%s);" % arg)
-        if not c_function and new_ref_to_callable:
-            self.add_line("Py_DECREF(%s);" % temp_callable_name)
-
-        self.add_line("if (0) {")
-        self.indent += 1
-        self.add_line("%s:" % exception_handler)
-        for (argname, newref) in argname_and_newrefs:
-            if newref:
-                self.add_line("Py_XDECREF(%s);" % (argname,))
-        if not c_function:
-            self.add_line("Py_XDECREF(%s);" % temp_callable_name)
-        self.add_line("goto %s;" % self.exception_handler_stack[-1])
-        self.indent -= 1
-        self.add_line("}")
-
-        # close block scope
-        self.add_line('}')
-
-        # python convention is that function call always returns a new ref:
-        if variable_name:
-            return True
-
     def visit_Attribute(self, attribute_node, variable_name=None):
         """
         Attribute is the node for, e.g., foo.bar.
@@ -819,7 +1082,7 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         assert variable_name, 'If not in template mode, we require a variable name to hold the result.'
 
         # block-scope this, because we require a temporary variable
-        self.add_line('{');
+        self.add_line('{')
         self.indent += 1
 
         attr_id = self.registry.register(attribute_node.attr)
@@ -837,25 +1100,17 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         self.indent -= 1
         self.add_line('}')
 
-    def _template_write(self, cexpr, test_null=True):
-        """Write a C expression to the transaction. This expression will
-        be evaluated multiple times --- make sure it's a variable name
-        or an array access, not a function call.
+    def _template_write(self, cexpr):
+        """Write a C expression to the transaction.
 
         Args:
             cexpr - C expression to write
             test_null - check the value for nullness first
         """
-        # TODO throw an exception on NULL instead of silently skipping?
-        if test_null:
-            self.add_line("if (%s != NULL) {" % (cexpr))
-            self.indent += 1
+        if not self.compiler_settings.template_mode:
+            return
 
         self.add_line("PyList_Append(this->%s, %s);" % (TRANSACTION_NAME, cexpr))
-
-        if test_null:
-            self.add_line("}")
-            self.indent -= 1
 
     def _make_tempvar(self):
         """Get a temporary variable with a unique name."""
@@ -874,13 +1129,16 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         """Resolve a name in isolation."""
         name = name_node.id
 
-        resolved_from_display = False
-        # all name resolution code will borrow the reference
+        # attempt resolution from a local variable
         cexpr_for_name = self._local_resolve_name(name)
+
         if not cexpr_for_name:
             # TODO this logic should include builtins;
             # also we'll support some nonstandard builtins
             cexpr_for_name = self._import_resolve_name(name)
+
+        if not cexpr_for_name:
+            cexpr_for_name = self._builtin_resolve_name(name)
 
         # attempt to resolve the name as an import
         if not cexpr_for_name:
@@ -888,34 +1146,44 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
 
         if not cexpr_for_name:
             if self.compiler_settings.template_mode:
-                cexpr_for_name = self._display_resolve_name(name)
-                resolved_from_display = True
+                return self._visit_Name_from_display(name_node, variable_name=variable_name)
             else:
                 raise Exception("Not in template mode; can't resolve %s statically" % (name,))
 
-        # if someone wanted this as a variable, return a borrowed ref,
-        # unless we resolved it from display, in which case we need a new
-        # ref in case we re-enter Python code and somehow destroy the object.
+        # all static resolutions return a borrowed ref:
         if variable_name:
             self.add_line("%s = %s;" % (variable_name, cexpr_for_name))
-            if resolved_from_display:
-                # TODO here's where we need to set an exception for failed display lookup
-                self.add_line("if (!%s) { goto %s; }" % (variable_name, self.exception_handler_stack[-1]))
-                # TODO we should allow path lookup to borrow a reference to variables from display ---
-                # otherwise path lookup does a back-to-back incref-decref on the base of the path,
-                # which is rather inelegant.
-                self.add_line("else { Py_INCREF(%s); }" % (variable_name,))
-            return resolved_from_display
-        # if they wanted it written, write it safely:
-        elif resolved_from_display:
-            # the accessor for resolving a name from display is a PyDict_GetItem,
-            # and we don't want to make that call more than once.
-            with self.block_scope():
-                tempvar = self._make_tempvar()
-                self.add_line("PyObject *%s = %s;" % (tempvar, cexpr_for_name))
-                self._template_write(tempvar, test_null=True)
+            return False
         else:
-            self._template_write(cexpr_for_name, test_null=False)
+            self._template_write(cexpr_for_name)
+
+    def _visit_Name_from_display(self, name_node, variable_name=None):
+        """Special-cased visitor for when the name must be resolved from display."""
+        name = name_node.id
+
+        if variable_name:
+            target = variable_name
+        else:
+            # require a block scope for the temporary
+            target = self._make_tempvar()
+            self.add_line("{")
+            self.indent += 1
+            self.add_line("PyObject *%s;" % (target,))
+
+        literal_id = self.registry.register(name)
+        self.add_line("%s = PyDict_GetItem(this->%s, %s[%d]);" %
+            (target, DISPLAY_NAME, LITERALS_ARRAY_NAME, literal_id))
+
+        self.add_line('if (!%s) { PyErr_SetString(PyExc_KeyError, "%s"); goto %s; }' %
+           (target, name, self.exception_handler_stack[-1]))
+        if variable_name:
+            # return a new reference:
+            self.add_line('Py_INCREF(%s);' % (variable_name,))
+            return True
+        else:
+            self._template_write(target)
+            self.indent -= 1
+            self.add_line("}")
 
     def _local_resolve_name(self, name):
         """Attempt to resolve a name as a native C++ local variable, i.e.,
@@ -927,6 +1195,12 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
 
         return None
 
+    def _builtin_resolve_name(self, name):
+        # TODO support all builtins
+        if name == 'None':
+            return 'Py_None'
+        return None
+
     def _import_resolve_name(self, name):
         """Attempt to resolve a name (statically) as an import."""
         import_path = (name,)
@@ -934,11 +1208,6 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
             return '%s[%d]' % (IMPORT_ARRAY_NAME, self.import_registry.symbols_to_index[import_path])
 
         return None
-
-    def _display_resolve_name(self, name):
-        """Attempt to resolve a name from the display dictionary."""
-        literal_id = self.registry.register(name)
-        return "PyDict_GetItem(this->%s, %s[%d])" % (DISPLAY_NAME, LITERALS_ARRAY_NAME, literal_id)
 
     def generate_path(self, attribute_node, variable_name=None):
         """
@@ -984,7 +1253,7 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
                 # path lookup returns a new ref
                 return True
             else:
-                self._template_write(result_var, test_null=False)
+                self._template_write(result_var)
                 # dispose of the extra ref:
                 self.add_line("Py_DECREF(%s);" % (result_var,))
 
@@ -1013,4 +1282,5 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         Entry point for the compiler when compiling a single class without dependencies.
         """
         self.visit(parsetree)
-        return generate_c_file(module_name, self.registry, self.path_registry, self.import_registry, [self])
+        return generate_c_file(module_name, self.registry, self.path_registry,
+                self.import_registry, self.expression_registry, [self])

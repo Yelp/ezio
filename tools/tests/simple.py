@@ -22,6 +22,12 @@ class SimpleTestCase(EZIOTestCase):
     def get_display(self):
         return display
 
+    def get_refcountables(self):
+        """Verify reference correctness for the list itself and all its members."""
+        refcountables = [NAMES]
+        refcountables.extend(NAMES)
+        return refcountables
+
     def test(self):
         super(SimpleTestCase, self).test()
         assert 'this is a comment' not in self.result
