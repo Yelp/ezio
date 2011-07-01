@@ -24,6 +24,23 @@ TERMINAL_EXCEPTION_HANDLER = "REPORT_EXCEPTION_TO_PYTHON"
 
 RESERVED_WORDS = set([DISPLAY_NAME, TRANSACTION_NAME, LITERALS_ARRAY_NAME, IMPORT_ARRAY_NAME, MAIN_FUNCTION_NAME])
 
+# AST node classes to the corresponding operator ID used by PyObject_RichCompare:
+CMPOP_TO_OPID = {
+        _ast.Eq: 'Py_EQ',
+        _ast.NotEq: 'Py_NE',
+        _ast.Lt: 'Py_LT',
+        _ast.LtE: 'Py_LE',
+        _ast.Gt: 'Py_GT',
+        _ast.GtE: 'Py_GE',
+}
+
+# Python built-in objects to their names in the C-API:
+PYBUILTIN_TO_CEXPR = {
+        'None': 'Py_None',
+        'True': 'Py_True',
+        'False': 'Py_False',
+}
+
 class CompilerSettings(object):
     """Holds all the switches and the knobs to control compilation."""
 
@@ -1112,9 +1129,13 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
 
         self.add_line("PyList_Append(this->%s, %s);" % (TRANSACTION_NAME, cexpr))
 
-    def _make_tempvar(self):
+    def _make_tempvar(self, prefix=None):
         """Get a temporary variable with a unique name."""
-        return "tempvar_%d" % (self.unique_id_counter.next(),)
+        if prefix:
+            prefix = "_%s" % (prefix,)
+        else:
+            prefix = ""
+        return "tempvar%s_%d" % (prefix, self.unique_id_counter.next(),)
 
     @contextmanager
     def block_scope(self):
@@ -1196,9 +1217,9 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         return None
 
     def _builtin_resolve_name(self, name):
+        if name in PYBUILTIN_TO_CEXPR:
+            return PYBUILTIN_TO_CEXPR[name]
         # TODO support all builtins
-        if name == 'None':
-            return 'Py_None'
         return None
 
     def _import_resolve_name(self, name):
@@ -1274,6 +1295,210 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         assert import_node.level == 0, 'Explicit relative imports unsupported.'
         for alias_node in import_node.names:
             self.import_registry.register(alias_node.name, asname=alias_node.asname, module=import_node.module)
+
+    def visit_If(self, if_node, variable_name=None):
+        """Compile an if statement."""
+        assert not variable_name, 'If is not an expression'
+
+        with self.block_scope():
+            # hold the C boolean status of the conditional:
+            conditional_tempvar = self._make_tempvar(prefix='conditional')
+            self.add_line("int %s;" % (conditional_tempvar,))
+
+            if isinstance(if_node.test, _ast.BoolOp):
+                self.visit_BoolOp(if_node.test, variable_name=None, boolean_name=conditional_tempvar)
+            else:
+                conditional_expr = self._make_tempvar(prefix='conditional_expr')
+                self.add_line("PyObject *%s;" % (conditional_expr,))
+                new_ref = self.visit(if_node.test, variable_name=conditional_expr)
+                self._truth_test(conditional_expr, conditional_tempvar, new_ref)
+                # we don't need the Python object for the conditional anymore:
+                if new_ref:
+                    self.add_line("Py_DECREF(%s);" % (conditional_expr,))
+
+            # now generate C++ if and else statements:
+            self.add_line("if (%s) {" % (conditional_tempvar,))
+            with self.increased_indent():
+                for stmt in if_node.body:
+                    self.visit(stmt)
+            self.add_line("}")
+
+            # note that the AST parser unpacks "elif quux:" into "else: if quux:":
+            if if_node.orelse:
+                self.add_line("else {")
+                with self.increased_indent():
+                    for stmt in if_node.orelse:
+                        self.visit(stmt)
+                self.add_line("}")
+
+    def _truth_test(self, variable_target, boolean_target, new_ref):
+        """Get the Python truth value of an object, with error checking."""
+        cleanup_ref1 = "Py_DECREF(%s)" % (variable_target,) if new_ref else ""
+        self.add_line("%s = PyObject_IsTrue(%s);" % (boolean_target, variable_target))
+        self.add_line("if (%s == -1) { %s; goto %s; }" %
+            (boolean_target, cleanup_ref1, self.exception_handler_stack[-1]))
+
+    def visit_BoolOp(self, boolop_node, variable_name=None, boolean_name=None):
+        """Compile logical 'and' and 'or'.
+
+        There's a unique wrinkle here. The semantics of Python are such that if a
+        is true and b is false, "a or b" will evaluate to a but "if a or b" will
+        only evaluate the truth of a once --- it's not as simple as evaluating
+        the 'and' expression and then testing the result again. Thus, we have to
+        expose an additional interface, the boolean_name variable, which can hold
+        the boolean (i.e., C int) truth value of the node as soon as it's known
+        (in the above example, as soon as a has been tested).
+        """
+        op_is_or = isinstance(boolop_node.op, _ast.Or)
+
+        self.add_line("{")
+
+        if boolean_name is not None:
+            boolean_target = boolean_name
+        else:
+            boolean_target = self._make_tempvar()
+            self.add_line("int %s = -1;" % (boolean_target,))
+
+        if variable_name is not None:
+            variable_target = variable_name
+        else:
+            variable_target = self._make_tempvar()
+            self._declare_and_initialize([variable_target])
+
+        # TODO FIXME support "a and b and c"
+        # in the meantime, a stupid workaround is ((a and b) and c)
+        assert len(boolop_node.values) == 2, "For now, an and/or must have exactly 2 operands."
+        value1, value2 = boolop_node.values
+
+        if isinstance(value1, _ast.BoolOp):
+            new_ref_1 = self.visit_BoolOp(value1, variable_name=variable_target,
+                boolean_name=boolean_target)
+        else:
+            new_ref_1 = self.visit(value1, variable_name=variable_target)
+            self._truth_test(variable_target, boolean_target, new_ref_1)
+
+        # for an OR, we defer to the second value on falsehood, otherwise we defer to it on truth
+        negation_required = "!" if op_is_or else ""
+        self.add_line("if (%s%s) {" % (negation_required, boolean_target,))
+        with self.increased_indent():
+            if new_ref_1:
+                self.add_line("Py_DECREF(%s);" % (variable_target,))
+
+            # as of now, we don't own any references, so no need for a cleanup handler:
+            if isinstance(value2, _ast.BoolOp):
+                new_ref_2 = self.visit_BoolOp(value2, variable_name=variable_target,
+                    boolean_name=boolean_target)
+            else:
+                new_ref_2 = self.visit(value2, variable_name=variable_target)
+                # enforce identical reference creation status for both code paths:
+                if new_ref_1 and not new_ref_2:
+                    self.add_line("Py_INCREF(%s);" % (variable_target,))
+                # evalute truth if the caller asked for it:
+                if boolean_name:
+                    self._truth_test(variable_target, boolean_target, new_ref_2)
+        self.add_line("}")
+        if new_ref_2 and not new_ref_1:
+            # enforce identital reference creation status:
+            self.add_line("else { Py_INCREF(%s); }" % (variable_target,))
+
+        new_ref = new_ref_1 or new_ref_2
+        if variable_name is None:
+            if new_ref:
+                self.add_line("Py_DECREF(%s);" % (variable_target))
+                self.add_line("}")
+        else:
+            self.add_line("}")
+            return new_ref
+
+    def visit_Compare(self, compare_node, variable_name=None):
+        """Compile all the binary comparisons, e.g., <=, is, not in."""
+        assert len(compare_node.ops) == 1, 'Multiple comparisons in the same expression are unsupported.'
+        op_node = compare_node.ops[0]
+        # see if we're doing a rich comparison:
+        op_id = CMPOP_TO_OPID.get(type(op_node))
+        # or an is:
+        is_or_is_not = type(op_node) in (_ast.Is, _ast.IsNot)
+        # or a containment:
+        in_or_not_in = type(op_node) in (_ast.In, _ast.NotIn)
+
+        with self.block_scope():
+            value1, value2 = self._make_tempvar(), self._make_tempvar()
+            self._declare_and_initialize((value1, value2))
+            if in_or_not_in:
+                contains_status = self._make_tempvar()
+                self.add_line("int %s = -1;" % (contains_status,))
+            if variable_name is not None:
+                target = variable_name
+            else:
+                target = self._make_tempvar()
+                self.add_line("PyObject *%s;" % (target,))
+            self.add_line("%s = NULL;" % (target,))
+            cleanup_label = 'CLEANUP_%d' % (self.unique_id_counter.next(),)
+
+            self.exception_handler_stack.append(cleanup_label)
+            newref1 = self.visit(compare_node.left, variable_name=value1)
+            newref2 = self.visit(compare_node.comparators[0], variable_name=value2)
+            self.exception_handler_stack.pop()
+
+            new_ref_to_target = False
+            if op_id:
+                # rich comparison returns a new reference
+                self.add_line("%s = PyObject_RichCompare(%s, %s, %s);" %
+                    (target, value1, value2, op_id))
+                new_ref_to_target = True
+            elif is_or_is_not:
+                # generate a simple pointer comparison
+                # if we wanted this to be fast, we could entangle it
+                # with the conditional statements and report the
+                # result of the comparison directly, rather than going
+                # through Py_True and Py_False
+                operator = "==" if isinstance(op_node, _ast.Is) else "!="
+                self.add_line("%s = (%s %s %s) ? Py_True : Py_False;" %
+                    (target, value1, operator, value2))
+            elif in_or_not_in:
+                self.add_line("%s = PySequence_Contains(%s, %s);" %
+                    (contains_status, value2, value1))
+                operator = "" if isinstance(op_node, _ast.In) else "!"
+                self.add_line("if (%s == -1) { goto %s; }" % (contains_status, cleanup_label))
+                self.add_line("%s = (%s%s) ? Py_True : Py_False;" %
+                    (target, operator, contains_status))
+
+            self.add_line("%s:" % (cleanup_label,))
+            # we don't need the comparison operands:
+            for val, newref in ((value1, newref1), (value2, newref2)):
+                if newref:
+                    self.add_line("Py_XDECREF(%s);" % (val,))
+            self.add_line("if (!(%s && %s && %s)) { Py_XDECREF(%s); goto %s; }" %
+                (value1, value2, target, target, self.exception_handler_stack[-1]))
+
+            if not variable_name and new_ref_to_target:
+                self.add_line("Py_DECREF(%s);" % (target,))
+            else:
+                return new_ref_to_target
+
+    def visit_UnaryOp(self, unary_op_node, variable_name=None):
+        """Compile a unary operation."""
+        assert isinstance(unary_op_node.op, _ast.Not), 'Right now, "not" is the only supported unary operator.'
+
+        with self.block_scope():
+            boolean_target = self._make_tempvar()
+            self.add_line("int %s = -1;" % (boolean_target,))
+            if variable_name is not None:
+                variable_target = variable_name
+            else:
+                variable_target = self._make_tempvar()
+                self._declare_and_initialize([variable_target])
+
+            new_ref = self.visit(unary_op_node.operand, variable_name=variable_target)
+            self._truth_test(variable_target, boolean_target, new_ref)
+            # we don't need the operand:
+            if new_ref:
+                self.add_line("Py_DECREF(%s);" % (variable_target,))
+            # negate the value of boolean_target:
+            self.add_line("%s = (%s) ? Py_False : Py_True;" % (variable_target, boolean_target,))
+            if variable_name:
+                # return a borrowed ref to Py_True or Py_False:
+                return False
 
     def run(self, module_name, parsetree):
         """

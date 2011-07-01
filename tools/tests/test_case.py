@@ -102,6 +102,7 @@ class EZIOTestCase(testify.TestCase):
         """
         self.expected_reference_counts = self.get_reference_counts()
         self.run_templating()
+        assert_equal(self.get_reference_counts(), self.expected_reference_counts)
 
         self.expected_result = self.result
         for _ in xrange(self.num_stress_test_iterations):

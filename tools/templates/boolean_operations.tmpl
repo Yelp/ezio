@@ -1,0 +1,38 @@
+#if $a or $b
+OK
+#else
+NO
+#end if
+
+#if True or $c
+OK
+#else
+NO
+#end if
+
+#if $d and False
+NO
+#else
+OK
+#end if
+
+#if $e and $f or $g
+OK
+#else
+NO
+#end if
+
+#if $h or $i
+OK
+#else
+NO
+#end if
+
+###if $k or $l or $m
+##NO
+###else
+##OK
+###end if
+
+$echo(0.0 or "OK")
+$echo("NO" and "OK")

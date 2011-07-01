@@ -1,0 +1,59 @@
+#if $true_obj1
+OK
+#end if
+#if $true_obj2
+OK
+#end if
+#if $f()
+OK
+#else
+NO
+#end if
+
+#if $false_obj1
+NO
+#end if
+
+#if $false_obj2
+NO
+#else
+OK
+#end if
+
+#if 3
+OK
+#end if
+
+#if None
+NO
+#else
+OK
+#end if
+
+#if $false_obj1
+NO
+#elif $true_obj1
+OK
+#else
+NO
+#end if
+
+#if $false_obj1
+NO
+#elif $false_obj2
+NO
+#else
+OK
+#end if
+
+#if not $false_obj1
+OK
+#else
+NO
+#end if
+
+#if not $true_obj1
+NO
+#else
+OK
+#end if
