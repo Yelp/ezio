@@ -12,9 +12,7 @@ class NodeVisitor(object):
     def visit(self, node, variable_name=None):
         """Visit a node."""
         method = 'visit_' + node.__class__.__name__
-        visitor = getattr(self, method, self.generic_visit)
+        visitor = getattr(self, method, None)
+        if visitor is None:
+            raise NotImplementedError, 'Generation for type %r not implemented.' % (type(node),)
         return visitor(node, variable_name=variable_name)
-
-    def generic_visit(self, node, variable_name=None):
-        """Called if no explicit visitor function exists for a node."""
-        raise NotImplementedError, 'Generation for type %r not implemented.' % (type(node),)

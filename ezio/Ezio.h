@@ -46,3 +46,24 @@ static PyObject *resolve_path(PyObject *base, Py_ssize_t path_length, ...) {
     va_end(argslist);
     return base;
 }
+
+/**
+  Basic RAII for PyObject*'s; store a pointer and a new reference, ensure
+  that the new reference is removed on function exit by putting an XDECREF
+  in the destructor. This is used to implement #set, but not to implement, e.g.,
+  function arguments or the temporary variables in for loops.
+ */
+class PySmartPointer {
+    public:
+        // this value can be NULL and always requires a NULL test before use
+        PyObject *referent;
+        PySmartPointer() { referent = NULL; }
+        PySmartPointer(PyObject *referent) : referent(referent) {}
+        ~PySmartPointer() { Py_XDECREF(referent); }
+        // we could overload the assignment operator here, but we don't really need the magic:
+        // the only value being added here is the destructor.
+        void set_referent(PyObject *new_referent) {
+            Py_XDECREF(referent);
+            referent = new_referent;
+        }
+};

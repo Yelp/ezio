@@ -361,6 +361,23 @@ class CallStrategy(object):
 
         driver.advance_past(driver.head)
 
+class SetStrategy(object):
+    """Handle conversion of #set, by turning it into an assignment statement."""
+
+    def accepts(self, string):
+        return string.startswith('set ')
+
+    def consume(self, py_out, driver):
+        # remove /^set/ and /\n$/
+        rest = driver.head[4:-1]
+
+        if rest.startswith('global '):
+            raise Exception('Set-global unsupported')
+        lvalue, _, rvalue = rest.partition(' ')
+        # generate an ordinary assignment statement
+        py_out.commit_line('%s = %s\n' % (sanitize_dollars(lvalue), sanitize_dollars(rvalue)))
+
+        driver.advance_past(driver.head)
 
 class CommentStrategy(object):
     """Substrategy for directives; "directives" beginning with #, i.e.,
@@ -411,7 +428,7 @@ class LineDirectiveSuperStrategy(object):
     """
 
     sub_strategies = (CommentStrategy(), BlockStrategy(), CallStrategy(), ExtendsStrategy(),
-            LinewisePurePythonStrategy(), EndSuiteStrategy())
+            SetStrategy(), LinewisePurePythonStrategy(), EndSuiteStrategy())
 
     def accepts(self, string):
         return bool(DIRECTIVE_REGEX.match(string))

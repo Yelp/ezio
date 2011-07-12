@@ -78,6 +78,11 @@ class LineBufferMixin(object):
         indent = self.indent if line else 0
         self.lines.append('%s%s' % (self.INDENT_WS * indent, line))
 
+    def add_fixup(self, fixup):
+        """Support the use of other LineBufferMixins as compiler fixups (in a broad sense). """
+        assert isinstance(fixup, LineBufferMixin), 'Fixup must be a LineBufferMixin.'
+        self.lines.append(fixup)
+
     @contextmanager
     def increased_indent(self, increment=1):
         assert increment > 0
@@ -85,6 +90,29 @@ class LineBufferMixin(object):
         yield
         self.indent -= increment
 
+    def finalize(self):
+        """Allow the class to dump lines (from internal state) that were not explicitly added.
+
+        ...yeah, that made no sense. See the use cases :-|
+        """
+        raise NotImplementedError
+
+    def get_lines(self):
+        """Return a list of all lines in the buffer, recursively descending into fixups."""
+        try:
+            self.finalize()
+        except NotImplementedError:
+            pass
+
+        result = []
+        for line in self.lines:
+            if isinstance(line, LineBufferMixin):
+                result.extend(line.get_lines())
+            elif isinstance(line, basestring):
+                result.append(line)
+            else:
+                raise ValueError(line)
+        return result
 
 class LiteralRegistry(LineBufferMixin):
     """Encapsulates the creation of Python string/int/bool objects for templating.
@@ -156,7 +184,7 @@ class LiteralRegistry(LineBufferMixin):
         """Return a C expression to access the literal at `index`."""
         return "%s[%d]" % (LITERALS_ARRAY_NAME, index)
 
-    def dump(self):
+    def finalize(self):
         self.add_line("static PyObject *%s[%d];" % (LITERALS_ARRAY_NAME, len(self.literals)))
         self.add_line("static void init_string_literals(void) {")
         with self.increased_indent():
@@ -165,7 +193,6 @@ class LiteralRegistry(LineBufferMixin):
                 cexpr_for_literal = self.dispatch_map[canonical_type](literal)
                 self.add_line("%s[%d] = %s;" % (LITERALS_ARRAY_NAME, pos, cexpr_for_literal))
         self.add_line("}")
-        return self.lines
 
 class ExpressionRegistry(LineBufferMixin):
     """Encapsulates static creation of Python objects that cannot necessarily be uniqued,
@@ -191,7 +218,7 @@ class ExpressionRegistry(LineBufferMixin):
         """Set C++ code that will perform assignment for a given lvalue."""
         self.lvalue_to_resolver[lvalue] = resolving_code
 
-    def dump(self):
+    def finalize(self):
         self.add_line("static PyObject *%s[%d];" % \
             (EXPRESSIONS_ARRAY_NAME, len(self.lvalue_to_resolver)))
         self.add_line("static void init_expressions(void) {")
@@ -206,12 +233,12 @@ class ExpressionRegistry(LineBufferMixin):
             # can always have an exception handler label available to it.
             self.add_line("%s:;" % (EXPRESSIONS_EXCEPTION_HANDLER,))
         self.add_line("}")
-        return self.lines
 
-class ImportRegistry(object):
+class ImportRegistry(LineBufferMixin):
     """Encapsulates tracking of imported names, and the code to perform the imports."""
 
     def __init__(self):
+        super(ImportRegistry, self).__init__()
         # list of string of C-API code for executing the imports
         self.imports = []
         self.symbols_to_index = {}
@@ -258,16 +285,16 @@ class ImportRegistry(object):
             return None
         return self._get_array_accessor(index)
 
-    def dump(self):
+    def finalize(self):
         # TODO: import failures are hidden and silent
-        pieces = []
         if self.num_objects:
-            pieces.append('static PyObject *%s[%d];' % (IMPORT_ARRAY_NAME, self.num_objects))
+            self.lines.append('static PyObject *%s[%d];' % (IMPORT_ARRAY_NAME, self.num_objects))
 
-        pieces.append('static void init_imports(void) {')
-        pieces.extend('\t' + code for code in self.imports)
-        pieces.append('}')
-        return pieces
+        self.lines.append('static void init_imports(void) {')
+        with self.increased_indent():
+            for import_line in self.imports:
+                self.add_line(import_line)
+        self.add_line('}')
 
 
 class PathRegistry(LineBufferMixin):
@@ -287,12 +314,12 @@ class PathRegistry(LineBufferMixin):
             return self.subpath_to_fname[subpath]
         self.subpath_to_fname[subpath] = "resolvepath_%d" % self.unique_id_counter.next()
         # ensure that all the path names have been registered
-        # (self.dump() won't be called until after the literal registry has been dumped)
+        # (self.finalize() won't be called until after the literal registry has been dumped)
         for subpath_item in subpath:
             self.literal_registry.register(subpath_item)
         return self.subpath_to_fname[subpath]
 
-    def dump(self):
+    def finalize(self):
         for subpath, fname in self.subpath_to_fname.iteritems():
             # generate a function that follows 'subpath' on 'base'
             # and returns a new reference to whatever it finds (or NULL)
@@ -338,7 +365,6 @@ class PathRegistry(LineBufferMixin):
             self.add_line("return base;")
             self.indent -= 1
             self.add_line("}")
-        return self.lines
 
 def extract_params_with_defaults(args):
     num_required_args = len(args.args) - len(args.defaults)
@@ -432,7 +458,7 @@ class ClassDefinition(LineBufferMixin):
 
         self.methods = {}
 
-    def dump(self):
+    def finalize(self):
         for method in self.methods.itervalues():
             method_definition = 'virtual PyObject *' if method['virtual'] else 'PyObject *'
             method_definition += method['name']
@@ -442,15 +468,13 @@ class ClassDefinition(LineBufferMixin):
         self.indent -= 1
         self.add_line('};')
 
-        return self.lines
-
 
 def generate_initial_segment():
-    return [
-        '#include "Python.h"',
-        '#include "Ezio.h"',
-        ''
-    ]
+    buf = LineBufferMixin()
+    buf.add_line('#include "Python.h"')
+    buf.add_line('#include "Ezio.h"')
+    buf.add_line()
+    return buf
 
 
 def generate_final_segment(module_name, function_names):
@@ -480,7 +504,7 @@ def generate_final_segment(module_name, function_names):
     buf.add_line('}')
     buf.add_line('')
 
-    return buf.lines
+    return buf
 
 
 def generate_hook(function_name, class_name):
@@ -509,35 +533,37 @@ def generate_hook(function_name, class_name):
     buf.indent -= 1
     buf.add_line('}')
 
-    return buf.lines
+    return buf
 
 
 def generate_c_file(module_name, literal_registry, path_registry, import_registry, expression_registry, compiled_classes):
     """Generate a complete C++ source file; string literals, path lookup functions,
     imports, all code for all classes, hooks, final segment.
     """
-    all_lines = []
-
-    all_lines += generate_initial_segment()
-    all_lines += literal_registry.dump()
-    all_lines += path_registry.dump() if path_registry is not None else []
-    all_lines += import_registry.dump()
-    all_lines += expression_registry.dump()
+    cpp_file = LineBufferMixin()
+    cpp_file.add_fixup(generate_initial_segment())
+    cpp_file.add_fixup(literal_registry)
+    if path_registry is not None:
+        cpp_file.add_fixup(path_registry)
+    cpp_file.add_fixup(import_registry)
+    cpp_file.add_fixup(expression_registry)
 
     # concatenate all class definitions and their method definitions
     hook_names = []
     for compiled_class in compiled_classes:
-        all_lines += compiled_class.class_definition.dump()
-        all_lines += compiled_class.lines
+        # add the class definition:
+        cpp_file.add_fixup(compiled_class.class_definition)
+        # and the code for the defined methods:
+        cpp_file.add_fixup(compiled_class)
 
         class_name = compiled_class.class_definition.class_name
         hook_name = "%s_%s" % (class_name, MAIN_FUNCTION_NAME)
-        all_lines += generate_hook(hook_name, class_name)
+        cpp_file.add_fixup(generate_hook(hook_name, class_name))
         hook_names.append(hook_name)
 
-    all_lines += generate_final_segment(module_name, hook_names)
+    cpp_file.add_fixup(generate_final_segment(module_name, hook_names))
 
-    return '\n'.join(all_lines)
+    return '\n'.join(cpp_file.get_lines())
 
 
 class CodeGenerator(LineBufferMixin, NodeVisitor):
@@ -582,8 +608,6 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         self.compiler_settings = CompilerSettings() if compiler_settings is None else compiler_settings
         self.unique_id_counter = itertools.count() if unique_id_counter is None else unique_id_counter
         self.expression_registry = ExpressionRegistry() if expression_registry is None else expression_registry
-
-        self.lines = []
 
         # our reimplementation of VFSSL:
         # static lookup among imported names, function arguments,
@@ -688,8 +712,17 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
             expression_lvalue = self.expression_registry.register()
             subgenerator.visit(default_expr, variable_name=expression_lvalue)
             self.expression_registry.set_expression_resolver(expression_lvalue,
-                '\n'.join(subgenerator.lines))
+                '\n'.join(subgenerator.get_lines()))
             self.add_line('if (%s == NULL) { %s = %s; }' % (param.id, param.id, expression_lvalue))
+
+        # add the fixup that declares all variables that are lvalues to #set statements,
+        # and the namespace to resolve them. This more or less mimics Python local variable
+        # semantics; a local variable is scoped to its enclosing function, not to any smaller
+        # block.
+        self.assignment_targets = LineBufferMixin()
+        self.assignment_namespace = {}
+        self.add_fixup(self.assignment_targets)
+        self.namespaces.append(self.assignment_namespace)
 
         # this would only be possible if function defs were nested:
         assert len(self.exception_handler_stack) == 0
@@ -704,6 +737,8 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         self.add_line('%s:' % exception_handler)
         self.add_line("return NULL;")
         self.indent -= 1
+        # remove the argument and assignment namespaces:
+        self.namespaces.pop()
         self.namespaces.pop()
         self.add_line("}")
 
@@ -1210,9 +1245,27 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         """Attempt to resolve a name as a native C++ local variable, i.e.,
         a method parameter or a for-loop temporary variable.
         """
+        name_status = self._get_name_status(name)
+        if name_status is None:
+            return None
+
+        if name_status == 'NATIVE':
+            return name
+
+        if name_status == 'SMART_POINTER':
+            # generate a NameError for uninitialized use of a #set variable:
+            self.add_line('if (!%s.referent) { PyErr_SetString(PyExc_NameError, "%s"); goto %s; }' %
+                (name, name, self.exception_handler_stack[-1]))
+            return '%s.referent' % (name,)
+
+        raise Exception("Can't process name %s with unsupported status %s" % (name, name_status,))
+
+    def _get_name_status(self, name):
+        """Gets the status, e.g., 'NATIVE', 'SMART_POINTER', of a name that can be resolved natively.
+        """
         for namespace in reversed(self.namespaces):
-            if name in namespace and namespace[name] == 'NATIVE':
-                return name
+            if name in namespace:
+                return namespace[name]
 
         return None
 
@@ -1499,6 +1552,31 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
             if variable_name:
                 # return a borrowed ref to Py_True or Py_False:
                 return False
+
+    def visit_Assign(self, assignment_node, variable_name=None):
+        """Compile a #set statement, in its form as a Python assignment."""
+        assert not variable_name, 'Assignments are not expressions.'
+        assert len(assignment_node.targets) == 1, 'Tuple unpacking is unsupported.'
+        target = assignment_node.targets[0]
+        assert isinstance(target, _ast.Name), 'Assign to non-names is unsupported.'
+        target_name = target.id
+
+        name_status = self._get_name_status(target_name)
+        assert name_status in ('SMART_POINTER', None), 'Cannot assign to a native name.'
+
+        if name_status is None:
+            # add a declaration of the requisite smart pointer
+            self.assignment_targets.add_line('PySmartPointer %s;' % (target_name,))
+            self.assignment_namespace[target_name] = 'SMART_POINTER'
+
+        with self.block_scope():
+            tempvar = self._make_tempvar()
+            self.add_line("PyObject *%s;" % (tempvar,))
+            new_ref = self.visit(assignment_node.value, variable_name=tempvar)
+            # smart pointers always contain a new reference:
+            if not new_ref:
+                self.add_line('Py_INCREF(%s);' % (tempvar,))
+            self.add_line('%s.set_referent(%s);' % (target_name, tempvar,))
 
     def run(self, module_name, parsetree):
         """
