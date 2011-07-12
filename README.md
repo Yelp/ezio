@@ -69,7 +69,6 @@ TODO
 
 These are P1 TODOs, i.e., serious obstacles to any productionization:
 
-* Support if statements
 * Support Cheetah's #call statement
 * Wrap template classes in Python classes, rather than having respond()
   at module scope; we could encapsulate this within the C module or do something
