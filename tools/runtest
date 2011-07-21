@@ -11,14 +11,12 @@ subprocess.check_call(['bin/ezio', 'tools/templates/%s.tmpl' % testname])
 template_module = __import__('tools.templates.%s' % testname, globals(), locals(), [testname])
 bootstrap_module = __import__('tools.tests.%s' % testname, globals(), locals(), [testname])
 
-transaction = []
 display = bootstrap_module.display
 responder_name = "%s_respond" % testname
 responder = getattr(template_module, responder_name)
 
 start_time = time.time()
-responder(display, transaction)
-result = "".join(transaction)
+result = responder(display)
 elapsed = time.time() - start_time
 
 print result

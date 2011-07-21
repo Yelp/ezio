@@ -21,6 +21,9 @@ EXPRESSIONS_ARRAY_NAME = 'expressions'
 EXPRESSIONS_EXCEPTION_HANDLER = 'HANDLE_EXCEPTIONS_EXPRESSIONS'
 MAIN_FUNCTION_NAME = "respond"
 TERMINAL_EXCEPTION_HANDLER = "REPORT_EXCEPTION_TO_PYTHON"
+# put all the template classes in this namespace,
+# so they don't conflict with C names from Python.h:
+CPP_NAMESPACE = "ezio_templates"
 
 RESERVED_WORDS = set([DISPLAY_NAME, TRANSACTION_NAME, LITERALS_ARRAY_NAME, IMPORT_ARRAY_NAME, MAIN_FUNCTION_NAME])
 
@@ -161,6 +164,8 @@ class LiteralRegistry(LineBufferMixin):
     def generate_str(self, value):
         # http://stackoverflow.com/questions/4000678/using-python-to-generate-a-c-string-literal-of-json
         formatted_value = '"' + value.replace('\\', r'\\').replace('"', r'\"').replace("\n", r'\n') + '"'
+        # TODO: add a compiler setting to make all literals unicode --- otherwise unicode-only
+        # filtering/escaping will have to convert the literals to unicode at join time
         if isinstance(formatted_value, str):
             return "PyString_FromString(%s)" % (formatted_value,)
         elif isinstance(formatted_value, unicode):
@@ -486,8 +491,8 @@ def generate_final_segment(module_name, function_names):
     buf.add_line("static PyMethodDef k_module_methods[] = {")
     buf.indent += 1
     for function_name in function_names:
-        buf.add_line('{"%s", (PyCFunction)%s, METH_VARARGS, "Perform templating for %s"},' %
-            (function_name, function_name, function_name))
+        buf.add_line('{"%s", (PyCFunction)%s::%s, METH_VARARGS, "Perform templating for %s"},' %
+            (function_name, CPP_NAMESPACE, function_name, function_name))
     buf.add_line("{NULL, NULL, 0, NULL}")
     buf.indent -= 1
     buf.add_line("};")
@@ -507,29 +512,48 @@ def generate_final_segment(module_name, function_names):
     return buf
 
 
-def generate_hook(function_name, class_name):
+def generate_hook(function_name, class_name, public=True):
     """Generate the static "hook" function that unpacks the Python arguments,
     dispatches to the C++ code, then returns the result to Python.
+
+    Args:
+        public - if False, generate the "old-style" hook that takes in a
+                 transaction list as second argument, then defers string join
+                 to the caller
     """
     buf = LineBufferMixin()
+    buf.add_line('static PyObject *%s(PyObject *self, PyObject *args) {' % (function_name,))
+    buf.indent += 1
 
-    buf.add_line('static PyObject *%s(PyObject *self, PyObject *args) {' % function_name)
-    buf.indent += 1
-    buf.add_line('PyObject *%s, *%s;' % (DISPLAY_NAME, TRANSACTION_NAME))
+    buf.add_line('PyObject *display, *transaction;')
     # TODO type-check list and dict here
-    buf.add_line('if (!PyArg_ParseTuple(args, "OO", &%s, &%s)) {'
-        % (DISPLAY_NAME, TRANSACTION_NAME))
-    buf.indent += 1
-    buf.add_line('return NULL;')
-    buf.indent -= 1
-    buf.add_line('}')
-    buf.add_line('%s template_obj(%s, %s);' % (class_name, DISPLAY_NAME, TRANSACTION_NAME))
+    if public:
+        unpack = '"O", &display'
+    else:
+        unpack = '"OO", &display, &transaction'
+    buf.add_line('if (!PyArg_ParseTuple(args, %s)) { return NULL; }' % (unpack,))
+    if public:
+        # create a new list for the transaction
+        buf.add_line('if (!(transaction = PyList_New(0))) { return NULL; }')
+
+    buf.add_line('%s::%s template_obj(display, transaction);' % (CPP_NAMESPACE, class_name,))
     buf.add_line('PyObject *status = template_obj.%s();' % (MAIN_FUNCTION_NAME,))
     buf.add_line('if (status) {')
-    buf.indent += 1
-    buf.add_line('Py_INCREF(status); return status;')
-    buf.indent -= 1
-    buf.add_line('} else { return NULL; }')
+    with buf.increased_indent():
+        if public:
+            buf.add_line('PyObject *result = ezio_concatenate(transaction);')
+            buf.add_line('Py_DECREF(transaction);')
+            # this wil propagate exceptions during concatenation:
+            buf.add_line('return result;')
+        else:
+            # just return the status value
+            buf.add_line('Py_INCREF(status); return status;')
+    buf.add_line('}')
+    # exit path for when templating encountered an exception
+    if public:
+        buf.add_line('Py_DECREF(transaction);')
+    buf.add_line('return NULL;')
+
     buf.indent -= 1
     buf.add_line('}')
 
@@ -548,8 +572,10 @@ def generate_c_file(module_name, literal_registry, path_registry, import_registr
     cpp_file.add_fixup(import_registry)
     cpp_file.add_fixup(expression_registry)
 
-    # concatenate all class definitions and their method definitions
+    # concatenate all class definitions and their method definitions,
+    # enclosing them in a C++ namespace:
     hook_names = []
+    cpp_file.add_line("namespace %s {" % (CPP_NAMESPACE,))
     for compiled_class in compiled_classes:
         # add the class definition:
         cpp_file.add_fixup(compiled_class.class_definition)
@@ -558,8 +584,9 @@ def generate_c_file(module_name, literal_registry, path_registry, import_registr
 
         class_name = compiled_class.class_definition.class_name
         hook_name = "%s_%s" % (class_name, MAIN_FUNCTION_NAME)
-        cpp_file.add_fixup(generate_hook(hook_name, class_name))
+        cpp_file.add_fixup(generate_hook(hook_name, class_name, public=True))
         hook_names.append(hook_name)
+    cpp_file.add_line("}")
 
     cpp_file.add_fixup(generate_final_segment(module_name, hook_names))
 

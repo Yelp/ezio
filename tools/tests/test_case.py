@@ -32,6 +32,8 @@ class EZIOTestCase(testify.TestCase):
 
     num_stress_test_iterations = 1
 
+    expected_result_type = str
+
     @property
     def template_name(self):
         if self.target_template is not None:
@@ -79,16 +81,16 @@ class EZIOTestCase(testify.TestCase):
 
     def run_templating(self, quiet=False):
         """Run the display dict against self.responder, get the output, measure the elapsed time."""
-        transaction = []
         display = self.get_display()
         responder = self.responder
 
         self.result = result = None
         start_time = time.time()
-        responder(display, transaction)
-        result = "".join(transaction)
+        result = responder(display)
         self.elapsed_time = time.time() - start_time
         self.result = result
+
+        assert_equal(type(result), self.expected_result_type)
 
         if self.verbose and not quiet:
             print self.result

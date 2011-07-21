@@ -47,6 +47,8 @@ Getting Started
 
 EZIO runs on Python 2.6 only (although eventually it should run on 2.5 as well).
 
+You may need to set your PYTHONPATH to include the root of the EZIO checkout.
+
 Compile `simple.tmpl` to `simple.so`:
 
     bin/ezio tools/templates/simple.tmpl
@@ -73,7 +75,6 @@ These are P1 TODOs, i.e., serious obstacles to any productionization:
 * Wrap template classes in Python classes, rather than having respond()
   at module scope; we could encapsulate this within the C module or do something
   clever in Python
-* Make a modified implementation of str.join() that casts non-strings to string
 * Make the lexer and the parser provide useful errors, based on the original source
   line that caused the error
 * Fix the build system not to require rebuilding entire projects at once
