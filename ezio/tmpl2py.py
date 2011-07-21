@@ -355,8 +355,9 @@ class CallStrategy(object):
         rest = driver.head[5:-1]
 
         call_name, _, args = rest.partition(' ')
-        sanitized = sanitize_dollars(args, self.munge_pair)
-        py_out.commit_line('with %s(%s) as __call__:\n' % (call_name, sanitized))
+        sanitized_call_name = sanitize_dollars(call_name)
+        sanitized_args = sanitize_dollars(args, self.munge_pair)
+        py_out.commit_line('with %s(%s) as __call__:\n' % (sanitized_call_name, sanitized_args))
         py_out.indent()
 
         driver.advance_past(driver.head)

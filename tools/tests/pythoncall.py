@@ -10,7 +10,9 @@ class ValueStore(object):
     def bar(self):
         return SHIBBOLETH
 
-display = {'baz': ValueStore()}
+VALUE_STORE = ValueStore()
+
+display = {'baz': VALUE_STORE}
 
 class TestCase(EZIOTestCase):
 
@@ -18,6 +20,9 @@ class TestCase(EZIOTestCase):
 
     def get_display(self):
         return display
+
+    def get_refcountables(self):
+        return [VALUE_STORE, SHIBBOLETH]
 
     def test(self):
         super(TestCase, self).test()
