@@ -12,7 +12,7 @@ import sys
 
 import testify
 from testify import setup
-from testify.assertions import assert_equal
+from testify.assertions import assert_equal, assert_raises
 
 from ezio.builder import MODULE_NAME
 
@@ -33,6 +33,8 @@ class EZIOTestCase(testify.TestCase):
     num_stress_test_iterations = 1
 
     expected_result_type = str
+
+    self_ptr = None
 
     @property
     def template_name(self):
@@ -82,11 +84,12 @@ class EZIOTestCase(testify.TestCase):
     def run_templating(self, quiet=False):
         """Run the display dict against self.responder, get the output, measure the elapsed time."""
         display = self.get_display()
+        self_ptr = self.self_ptr
         responder = self.responder
 
         self.result = result = None
         start_time = time.time()
-        result = responder(display)
+        result = responder(display, self_ptr)
         self.elapsed_time = time.time() - start_time
         self.result = result
 
@@ -112,3 +115,21 @@ class EZIOTestCase(testify.TestCase):
             # check that the result hasn't changed:
             assert_equal(self.result, self.expected_result)
             assert_equal(self.get_reference_counts(), self.expected_reference_counts)
+
+
+    def perform_exception_test(self, exc_class):
+        self.expected_reference_counts = self.get_reference_counts()
+        for _ in xrange(self.num_stress_test_iterations + 1):
+            # there's a fun wrinkle here. we have to make sure the raised exception
+            # is completely out of scope and destroyed before we check the reference
+            # counts again; otherwise it may hold incidental references to objects,
+            # which will appear to the reference count checks here as though it were
+            # a memory leak. not that this, you know, actually happened to me or anything.
+            assert_raises(exc_class, self.run_templating)
+            assert_equal(self.get_reference_counts(), self.expected_reference_counts)
+
+        try:
+            self.run_templating()
+        except exc_class, e:
+            # now that we're done counting references, save the exception for examination:
+            self.exception = e

@@ -16,7 +16,7 @@ responder_name = "%s_respond" % testname
 responder = getattr(template_module, responder_name)
 
 start_time = time.time()
-result = responder(display)
+result = responder(display, None)
 elapsed = time.time() - start_time
 
 print result

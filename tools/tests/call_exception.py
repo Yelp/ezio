@@ -14,7 +14,9 @@ class ExceptionalObject(object):
     def raise_exception(self):
         raise AdHocException('this is an ad-hoc exception')
 
-display = {'bar': ExceptionalObject()}
+an_exceptional_object = ExceptionalObject()
+
+display = {'bar': an_exceptional_object}
 
 class TestCase(EZIOTestCase):
 
@@ -23,8 +25,11 @@ class TestCase(EZIOTestCase):
     def get_display(self):
         return display
 
+    def get_refcountables(self):
+        return [an_exceptional_object]
+
     def test(self):
-        assert_raises(AdHocException, self.run_templating)
+        self.perform_exception_test(AdHocException)
 
 if __name__ == '__main__':
     testify.run()

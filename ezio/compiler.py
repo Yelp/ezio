@@ -24,6 +24,7 @@ TERMINAL_EXCEPTION_HANDLER = "REPORT_EXCEPTION_TO_PYTHON"
 # put all the template classes in this namespace,
 # so they don't conflict with C names from Python.h:
 CPP_NAMESPACE = "ezio_templates"
+BASE_TEMPLATE_NAME = 'ezio_base_template'
 
 RESERVED_WORDS = set([DISPLAY_NAME, TRANSACTION_NAME, LITERALS_ARRAY_NAME, IMPORT_ARRAY_NAME, MAIN_FUNCTION_NAME])
 
@@ -385,33 +386,13 @@ def positional_args_and_self_arg(args):
 
 class ClassDefinition(LineBufferMixin):
     """Encapsulates a definition of a class.
-    This implementation relies on all classes being compiled
-    at the same time, in the correct order...
+
+    This implementation relies on all classes being compiled at the same time,
+    and in the correct order.
     """
 
-    def generate_constructor(self):
-        # if there's a superclass def we don't declare members or a new constructor
-        if self.superclass_def:
-            self.add_line('%s (PyObject *%s, PyObject *%s) : %s(%s, %s) {}' % \
-                (self.class_name, DISPLAY_NAME, TRANSACTION_NAME,
-                self.superclass_def.class_name, DISPLAY_NAME, TRANSACTION_NAME))
-            return
-
-        # otherwise, declare members:
-        self.add_line('PyObject *%s, *%s;' % (DISPLAY_NAME, TRANSACTION_NAME))
-
-        self.add_line('%s (PyObject *%s, PyObject *%s) {' % (self.class_name, DISPLAY_NAME, TRANSACTION_NAME))
-        self.indent += 1
-        # could use an initialization list for this, but whatever:
-        for varname in (DISPLAY_NAME, TRANSACTION_NAME):
-            self.add_line('this->%s = %s;' % (varname, varname))
-        self.indent -= 1
-        self.add_line('}')
-
-        # no destructor, this thing doesn't own any dynamically allocated memory
-        # (really it only exists because we need its vtable)
-
     def get_method(self, method_name):
+        """Recursively walk up the inheritance chain to get the method definition."""
         if self.superclass_def is not None:
             superclass_method = self.superclass_def.get_method(method_name)
             if superclass_method is not None:
@@ -445,18 +426,28 @@ class ClassDefinition(LineBufferMixin):
     def __init__(self, class_name, superclass_def):
         super(ClassDefinition, self).__init__()
 
+        assert class_name != BASE_TEMPLATE_NAME, '%s is reserved for the base template.' \
+                % (BASE_TEMPLATE_NAME,)
+
         self.class_name, self.superclass_def = class_name, superclass_def
 
-        superclass_declaration = ''
         if superclass_def is not None:
-            superclass_declaration = ': public %s ' % superclass_def.class_name
-        self.add_line('class %s %s{' % (class_name, superclass_declaration))
+            superclass_name = superclass_def.class_name
+        else:
+            superclass_name = BASE_TEMPLATE_NAME
 
+        self.add_line('class %s : public %s {' % (class_name, superclass_name))
         self.indent += 1
         # all methods and members are C++-public:
         self.add_line('public:')
 
-        self.generate_constructor()
+        # generate a call to the superclass constructor
+        constructor_args = "PyObject *display, PyObject *transaction, PyObject *self_ptr";
+        superclass_constructor_call = "%s(display, transaction, self_ptr)" % (superclass_name,)
+        self.add_line('%s (%s) : %s {}' % (self.class_name, constructor_args,
+            superclass_constructor_call,))
+        # no destructor, this thing doesn't own any dynamically allocated memory
+        # (really it only exists because we need its vtable)
 
         self.methods = {}
 
@@ -522,18 +513,19 @@ def generate_hook(function_name, class_name, public=True):
     buf.add_line('static PyObject *%s(PyObject *self, PyObject *args) {' % (function_name,))
     buf.indent += 1
 
-    buf.add_line('PyObject *display, *transaction;')
+    buf.add_line('PyObject *display, *transaction, *self_ptr;')
     # TODO type-check list and dict here
     if public:
-        unpack = '"O", &display'
+        unpack = '"OO", &display, &self_ptr'
     else:
-        unpack = '"OO", &display, &transaction'
+        unpack = '"OOO", &display, &transaction, &self_ptr'
     buf.add_line('if (!PyArg_ParseTuple(args, %s)) { return NULL; }' % (unpack,))
     if public:
         # create a new list for the transaction
         buf.add_line('if (!(transaction = PyList_New(0))) { return NULL; }')
 
-    buf.add_line('%s::%s template_obj(display, transaction);' % (CPP_NAMESPACE, class_name,))
+    buf.add_line('if (self_ptr == Py_None) { self_ptr = NULL; }')
+    buf.add_line('%s::%s template_obj(display, transaction, self_ptr);' % (CPP_NAMESPACE, class_name,))
     buf.add_line('PyObject *status = template_obj.%s();' % (MAIN_FUNCTION_NAME,))
     buf.add_line('if (status) {')
     with buf.increased_indent():
@@ -802,8 +794,8 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
 
         # these names can be resolved "natively", i.e., they're in the C namespace
         namespace = dict((argname, 'NATIVE') for argname in positional_args)
-        # this is to facilitate later compilation of code that refers to "self";
-        # right now, any references to "self" should produce an error
+        # this name can be resolved to this->self_ptr (with a NULL test);
+        # in specialized contexts, attribute accesses on it can be resolved to native code
         if self_arg is not None:
             namespace[self_arg] = 'SELF'
         return argslist_str, namespace
@@ -932,10 +924,17 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
 
         function_name = None
         c_method = None
+        func_node = call_node.func
         # a c function is a bare name that appears in the current class definition as a method:
-        if isinstance(call_node.func, _ast.Name):
-            function_name = call_node.func.id
+        if isinstance(func_node, _ast.Name):
+            function_name = func_node.id
             c_method = self.class_definition.get_method(function_name)
+        # or else a reference to self.asdf where 'asdf' appears in the class definition as a method:
+        elif isinstance(func_node, _ast.Attribute):
+            if (isinstance(func_node.value, _ast.Name)
+                and self._get_name_status(func_node.value.id) == 'SELF'):
+                function_name = func_node.attr
+                c_method = self.class_definition.get_method(function_name)
 
         if not c_method and call_node.keywords:
             return self._visit_Call_dynamic_kwargs(call_node, variable_name=variable_name)
@@ -951,7 +950,7 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         result_name = None
         if not c_method:
             temp_callable_name = "tempcallablevar_%d" % unique_id
-            self.add_line('PyObject *%s;' % temp_callable_name)
+            self.add_line('PyObject *%s = NULL;' % temp_callable_name)
 
             # were we given an externally scoped C variable to put the result in?
             if variable_name:
@@ -1006,7 +1005,7 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         for (argname, newref) in argname_and_newrefs:
             if newref:
                 self.add_line("Py_XDECREF(%s);" % (argname,))
-        if not c_method:
+        if not c_method and new_ref_to_callable:
             self.add_line("Py_XDECREF(%s);" % temp_callable_name)
         self.add_line("goto %s;" % self.exception_handler_stack[-1])
         self.indent -= 1
@@ -1299,6 +1298,13 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
             self.add_line('if (!%s.referent) { PyErr_SetString(PyExc_NameError, "%s"); goto %s; }' %
                 (name, name, self.exception_handler_stack[-1]))
             return '%s.referent' % (name,)
+
+        if name_status == 'SELF':
+            # generate a NameError if we have no wrapped object:
+            error_msg = 'No wrapped object to resolve the self-name %s' % (name,)
+            self.add_line('if (!this->self_ptr) { PyErr_SetString(PyExc_NameError, "%s"); goto %s; }' %
+                (error_msg, self.exception_handler_stack[-1]))
+            return "this->self_ptr"
 
         raise Exception("Can't process name %s with unsupported status %s" % (name, name_status,))
 

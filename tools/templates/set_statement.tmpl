@@ -1,23 +1,23 @@
 #import os
 
 #def my_func()
-#set local_var bar
+#set local_var = bar
 my_func: $local_var
 #end def
 
-#set local_var quux
+#set local_var = quux
 respond: $local_var
 
 $my_func()
 
 ## exercise assignment statements that borrow a reference:
-#set local_var_2 os
-#set local_var_3 os.__file__
+#set local_var_2 = os
+#set local_var_3 = os.__file__
 os.__file__: $local_var_3
 again: $local_var_2.__file__
-#set local_var bat
+#set local_var = bat
 respond_reassignment: $local_var
 
 ## exercise assignment statements with nontrivial rvalues:
-#set local_var_in_pipes $add_pipes($local_var)
+#set local_var_in_pipes = $add_pipes($local_var)
 in_pipes: $local_var_in_pipes

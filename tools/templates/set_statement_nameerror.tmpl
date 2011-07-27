@@ -1,0 +1,10 @@
+#import os
+
+#set $local_var = $bar()
+local_var is $local_var
+
+#if False
+    #set local_var_2 = "asdf"
+#end if
+## this should raise a NameError
+local_var_2 is $local_var_2

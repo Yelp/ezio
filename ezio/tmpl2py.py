@@ -105,7 +105,7 @@ def sanitize_dollars(string, munge_pair=IDENTITY_MUNGEPAIR):
             lines = string.split('\n')
 
             if lines[lineno][colno] != '$':
-                raise EzioNotDollarSignError()
+                raise EzioNotDollarSignError(lines[lineno][colno], lineno, colno)
 
             # delete the offending '$'
             lines[lineno] = lines[lineno][:colno] + lines[lineno][colno+1:]
@@ -414,9 +414,10 @@ class SetStrategy(object):
 
         if rest.startswith('global '):
             raise Exception('Set-global unsupported')
-        lvalue, _, rvalue = rest.partition(' ')
+        lvalue, _, rvalue = rest.partition('=')
         # generate an ordinary assignment statement
-        py_out.commit_line('%s = %s\n' % (sanitize_dollars(lvalue), sanitize_dollars(rvalue)))
+        py_out.commit_line('%s = %s\n' %
+                (sanitize_dollars(lvalue.strip()), sanitize_dollars(rvalue.strip())))
 
         driver.advance_past(driver.head)
 

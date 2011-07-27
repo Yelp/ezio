@@ -68,6 +68,23 @@ class PySmartPointer {
         }
 };
 
+namespace ezio_templates {
+
+    /** Base C++ class for all templates. */
+    class ezio_base_template {
+        public:
+            // display dictionary: namespace for dynamic template lookups
+            PyObject *display;
+            // a python list containing the pieces of the document being assembled
+            PyObject *transaction;
+            // if not NULL, a Python object that can be the target of dynamic references to `self`
+            PyObject *self_ptr;
+
+            ezio_base_template(PyObject *display, PyObject *transaction, PyObject *self_ptr) :
+                display(display), transaction(transaction), self_ptr(self_ptr) {}
+    };
+}
+
 /* Status codes that can be returned by the coercion/filtering code. */
 static const int COERCED_TO_STR = 0;
 static const int COERCED_TO_UNICODE = 1;
