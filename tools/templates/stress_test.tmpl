@@ -20,9 +20,15 @@
 #def ezio()
     startit
     $myblock($asdf)
-    <td>stuff</td><td>$$bag.five</td>
+    <td>stuff</td><td>\$bag.five</td>
     $myfunc(asdf, f)
 #end def
 
 <!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"  "http://www.w3.org/TR/html4/loose.dtd">
 $ezio()
+
+\#def notadef
+this isn't a \$function
+one backslash looks like \ and two look like \\!
+Two dollar signs make a $$
+\#end def

@@ -33,7 +33,7 @@ class TestCase(EZIOTestCase):
     def test(self):
         super(TestCase, self).test()
 
-        assert_equal(self.result.split(), ['OK'] * 10)
+        assert_equal(self.result.split(), ['OK'] * 11)
 
 if __name__ == '__main__':
     testify.run()

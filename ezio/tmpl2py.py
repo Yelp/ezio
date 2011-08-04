@@ -129,12 +129,9 @@ def idempotent_de_dollar(string):
 
 # a ``#`` is the first non-whitespace character
 DIRECTIVE_REGEX = re.compile('^\s*#')
-
-def stringify_literal(string):
-    """Turn a chunk of literal text into a Python string literal, unescaping
-    dollar signs and making sure that it fits on one line.
-    """
-    return repr(string.replace('$$', '$'))
+# the Cheetah metacharacters: $, #, and \
+# (the \ and the $ are regex metacharacters and must be escaped here)
+METACHARACTER_REGEX = re.compile(r'#|\\|\$')
 
 # a group of an odd number of dollar signs
 UNESCAPED_DOLLAR = re.compile( r'''
@@ -160,21 +157,59 @@ class LiteralTextStrategy(object):
     def consume(self, py_out, driver):
         consumed = ''
 
-        while True: # terminate after the end of literal text
+        # loop until we encounter the end of of literal text
+        while True:
 
-            # These two ifs are termination conditions (note the breaks)
+            # search for any of our special characters
+            metacharacter_match = METACHARACTER_REGEX.search(driver.head)
 
-            if DIRECTIVE_REGEX.match(driver.head): # the last line
-                py_out.commit_line(stringify_literal(consumed) + '\n')
-                break
+            # read "continue" as "we're still in literal text" and "break" as "we're now outside it"
+            if metacharacter_match:
+                metacharacter = metacharacter_match.group(0)
+                start_pos = metacharacter_match.start(0)
+                before_metacharacter = driver.head[:start_pos]
+                # TODO if a line begins with whitespace and a #, should we suppress the whitespace?
+                consumed += before_metacharacter
 
-            match = UNESCAPED_DOLLAR.search(driver.head)
-            if match:
-                before_dollar = driver.head[:match.end(1)]
-                consumed += before_dollar
-                driver.advance_past(before_dollar)
-                py_out.commit_line(stringify_literal(consumed) + '\n')
-                break
+                # read the character following the metacharacter
+                subsequent_pos = start_pos + 1
+                subsequent_char = driver.head[subsequent_pos] if subsequent_pos < len(driver.head) \
+                        else None
+
+                # OK, skip over the consumed text; leave the metacharacter for now
+                driver.advance_past(before_metacharacter)
+
+                if metacharacter == "\\":
+                    if subsequent_char in ("#", "$"):
+                        # subsequent char is an escaped metacharacter, consume and skip it
+                        # i.e., \# means #, and \$ means $
+                        driver.advance_past(driver.head[:2])
+                        consumed += subsequent_char
+                        continue
+                    else:
+                        # next char is not a metacharacter; write the backslash
+                        # i.e., \a means \a, and \<newline> means \<newline>
+                        driver.advance_past(driver.head[:1])
+                        consumed += "\\"
+                        continue
+                elif metacharacter == "#":
+                    # unescaped # --- break out into directive mode
+                    py_out.commit_line(repr(consumed) + '\n')
+                    break
+                elif metacharacter == "$":
+                    if subsequent_char.isalpha() or subsequent_char in ('_', '(', '[', '{'):
+                        # this is the start of a valid Python identifer,
+                        # or a Cheetah placeholder block. break out:
+                        py_out.commit_line(repr(consumed) + '\n')
+                        break
+                    else:
+                        # this is just a $, e.g., $100.00
+                        driver.advance_past(driver.head[:1])
+                        consumed += "$"
+                        continue
+                else:
+                    # regex matched a non-metacharacter; this should never happen
+                    raise ValueError(metacharacter)
 
             # Consume the current line.
             # Only one line is ever in driver.head during this loop.
@@ -189,7 +224,7 @@ class LiteralTextStrategy(object):
                 # When a directive is the last line in the file, this will
                 # terminate us without adding a spurious newline.
                 if consumed != '':
-                    py_out.commit_line(stringify_literal(consumed) + '\n')
+                    py_out.commit_line(repr(consumed) + '\n')
                 break
 
             # else continue (implicitly)
@@ -221,10 +256,11 @@ def mk_mungepair(prefix, suffix, compound=False):
 
     return MungePair(munger, unmunger)
 
-# Cut out the key to use for getting the munger/unmunger pair.
+# Cut out the key to use for getting the munger/unmunger pair;
+# we're looking for either an @ or the alphabetical characters of a Python keyword.
 # This pattern has the important property of always matching, even if it is
 # the empty string, so we can safely .group(0) off of a .match() call.
-MUNGE_KEYGETTER = re.compile('^(@|\S*)')
+MUNGE_KEYGETTER = re.compile('^(@|[A-Za-z]*)')
 
 _munge_pairs = (
 
@@ -288,7 +324,7 @@ class LinewisePurePythonStrategy(object):
         if kwd in ('else', 'elif', 'except', 'finally'):
             py_out.dedent()
 
-        for prefix in driver.increasing_prefixes('\n'):
+        for prefix in driver.increasing_prefixes('#\n'):
             munged = munge_pair.munge(prefix)
             try:
                 ast.parse(idempotent_de_dollar(munged))
@@ -309,8 +345,12 @@ class EndSuiteStrategy(object):
         return string.startswith('end')
 
     def consume(self, py_out, driver):
-        # advance_past() everything, because we only have one line
-        driver.advance_past(driver.head)
+        # read up to a # or a \n, then stop
+        for prefix in driver.increasing_prefixes('#\n'):
+            driver.advance_past(prefix)
+            py_out.dedent()
+            return
+        # EOF without a newline:
         py_out.dedent()
 
 class ExtendsStrategy(object):
@@ -744,16 +784,18 @@ class EzioTemplateDriver(object):
 
         self.head += line
 
-    def increasing_prefixes(self, char):
-        """Return increasing prefixes ending with char.
+    def increasing_prefixes(self, chars):
+        """Return increasing prefixes ending with a char in `chars`.
 
         This is the secret sauce for plucking out syntactically valid Python
         from the template.
         """
 
         beginpos = 0
+        # make a regex matching any character in chars
         # don't worry, re.compile caches compiled regexes
-        regex = re.compile(re.escape(char))
+        regex_str = '|'.join(re.escape(char) for char in chars)
+        regex = re.compile(regex_str)
 
         while beginpos != len(self.head): # have more to process
 

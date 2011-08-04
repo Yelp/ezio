@@ -8,7 +8,7 @@ $silly.sillysilly________silly['si' + 2 * r'l' + u'''y''':sillyfuncall(*args)].s
 #block foo_bar
 in a block
 #end block
-read past the directive, and into the "placeholder" before the $$i, I dare you!
+read past the directive, and into the "placeholder" before the \$i, I dare you!
 #for $i in $range(10)
 
 foo
@@ -50,7 +50,10 @@ inside a string literal this $ is untouched
 #                          **{'quuux': 'quuuux'})
 more literal text
 #end for
-less indented literal text with a literal $$ dollar sign
+less indented literal text with a literal $ dollar sign
+
+\#def this is not actually a def
+nor is this actually a \$placeholder
 
 yayayayay
 prepare for the KILLER
