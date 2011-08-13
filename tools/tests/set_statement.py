@@ -11,11 +11,15 @@ from tools.tests.test_case import EZIOTestCase
 def add_pipes(my_string):
     return "|%s|" % (my_string,)
 
+DEFAULT_ARGUMENT = 'this is the first call to my_func'
+def get_default_str(): return DEFAULT_ARGUMENT
+
 display = {
     'add_pipes': add_pipes,
     'bar': 'bar',
     'bat': 'bat',
     'quux': 'quux',
+    'get_default_str': get_default_str,
 }
 
 class TestCase(EZIOTestCase):
@@ -26,17 +30,21 @@ class TestCase(EZIOTestCase):
         return display
 
     def get_refcountables(self):
-        return sorted(display.itervalues()) + [os, os.__file__]
+        return sorted(display.itervalues()) + [os, os.__file__, DEFAULT_ARGUMENT, get_default_str]
 
     def test(self):
         super(TestCase, self).test()
 
-        assert_in('my_func: bar', self.result)
-        assert_in('respond: quux', self.result)
-        assert_in('os.__file__: %s' % (os.__file__,), self.result)
-        assert_in('again: %s' % (os.__file__,), self.result)
-        assert_in('respond_reassignment: bat', self.result)
-        assert_in('in_pipes: |bat|', self.result)
+        expected_lines = [
+                'respond: quux',
+                'my_func: bar',
+                'os.__file__: %s' % (os.__file__,),
+                'again: %s' % (os.__file__,),
+                'respond_reassignment: bat',
+                'in_pipes: |bat|',
+                DEFAULT_ARGUMENT,
+                'this is the second call to my_func',
+        ]
 
 if __name__ == '__main__':
     testify.run()

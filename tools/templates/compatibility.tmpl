@@ -1,0 +1,25 @@
+#from ezio.compatibility import EZIO_skip
+#from ezio.compatibility import EZIO_noop
+
+## this should get skipped in compilation,
+## and `$first` should get looked up in the display dict
+#@EZIO_skip
+#def first()
+unreachable
+#end def
+
+## this should get blanked during compilation,
+## so it shouldn't print "unreachable" but it should still mask $second from a display lookup
+#@EZIO_noop
+#def second()
+unreachable
+#end def
+
+## This is a normal function definition
+#def third()
+third
+#end def
+
+$first()
+$second()
+$third()

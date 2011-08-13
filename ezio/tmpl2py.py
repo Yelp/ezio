@@ -42,6 +42,8 @@ import tokenize
 from collections import namedtuple
 from StringIO import StringIO
 
+from ezio.constants import BLOCK_TAG, CURRENT_METHOD_TAG
+
 class EzioLexError(Exception):
     pass
 
@@ -374,6 +376,23 @@ class ExtendsStrategy(object):
         py_out.commit_line(import_line)
         driver.advance_past(driver.head)
 
+class SuperclassStrategy(object):
+    """Handles conversion of #super (this is not to be confused with a "superstrategy"."""
+
+    def accepts(self, string):
+        return string.startswith('super')
+
+    def consume(self, py_out, driver):
+        # remove /^super/ and whitespace
+        rest = driver.head[5:].strip()
+        # assert that the leftovers look like a function call
+        assert rest[0] == '(' and rest[-1] == ')'
+
+        # XXX we don't know the actual name of the current method;
+        # use a magic word that the compiler will understand instead
+        py_out.commit_line("super(type(self), self).%s%s\n" % (CURRENT_METHOD_TAG, rest,))
+        driver.advance_past(driver.head)
+
 class CallStrategy(object):
     """Handle conversion of #call.
 
@@ -456,7 +475,7 @@ class BlockStrategy(object):
         # exception that can capture and present this information to the user.
         assert bool(PY_IDENTIFIER.match(name)), "invalid block identifier"
 
-        py_out.commit_line('def DIRECTIVE__block__%s():\n' % (name,))
+        py_out.commit_line('def %s__%s():\n' % (BLOCK_TAG, name,))
         py_out.indent()
 
         driver.advance_past(driver.head)
@@ -470,7 +489,7 @@ class LineDirectiveSuperStrategy(object):
     """
 
     sub_strategies = (CommentStrategy(), BlockStrategy(), CallStrategy(), ExtendsStrategy(),
-            SetStrategy(), LinewisePurePythonStrategy(), EndSuiteStrategy())
+            SuperclassStrategy(), SetStrategy(), LinewisePurePythonStrategy(), EndSuiteStrategy())
 
     def accepts(self, string):
         return bool(DIRECTIVE_REGEX.match(string))

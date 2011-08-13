@@ -116,6 +116,7 @@ class EZIOTestCase(testify.TestCase):
             assert_equal(self.result, self.expected_result)
             assert_equal(self.get_reference_counts(), self.expected_reference_counts)
 
+        self.lines = [line for line in self.result.split('\n') if line]
 
     def perform_exception_test(self, exc_class):
         self.expected_reference_counts = self.get_reference_counts()

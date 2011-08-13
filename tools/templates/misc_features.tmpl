@@ -1,0 +1,38 @@
+## tuples
+#set my_created_tuple = (1, 2, 3, 4, 5)
+#for arg in my_created_tuple
+$arg
+#end for
+
+## lists
+#set my_created_list = [6, 7, 8, 9, 10]
+#for arg in my_created_list
+$arg
+#end for
+
+## tuples, mixing it up a little
+#set mytuple = (11, "twelve", 13, get_fourteen(), 15)
+#for arg in mytuple
+$arg
+#end for
+
+## if-expression (ternary operator)
+$("OK" if True else "NO")
+$($ok if True else $no)
+#for arg in ($oks if ($false_obj or $true_obj) else $nos)
+$arg
+#end for
+
+## subscripting
+$mydict["a"]
+$mydict[$mykey]
+$mylist[0]
+$mylist[$myindex]
+
+## unary operations
+$("OK" if -one == -1 else "NO")
+
+## binary operations
+$("OK" if 1 + 1 == 2 else "NO")
+## (this should be an integer division)
+$("NO" if 3/2 == 1.5 else "OK")

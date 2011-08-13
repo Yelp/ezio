@@ -36,7 +36,7 @@ class SimpleTestCase(EZIOTestCase):
     def test(self):
         super(SimpleTestCase, self).test()
         assert_equal(
-            self.result.strip().split('\n'),
+            self.lines,
             ['first', '1', 'second', '2.0', 'third', 'asdf', 'fourth', 'ohai',
              'fifth', 'hommage à jack'
             ]

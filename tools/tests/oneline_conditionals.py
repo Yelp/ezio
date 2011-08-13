@@ -32,8 +32,7 @@ class TestCase(EZIOTestCase):
     def test(self):
         super(TestCase, self).test()
 
-        lines = [line for line in self.result.split('\n') if line]
-        assert_equal(lines, [
+        assert_equal(self.lines, [
             "I'm OK",
             "I'm OK",
             "The alphabet begins with a b c d e",
@@ -41,7 +40,6 @@ class TestCase(EZIOTestCase):
             "I'm OK still",
             "Success!",
         ])
-        print lines
 
 if __name__ == '__main__':
     testify.run()

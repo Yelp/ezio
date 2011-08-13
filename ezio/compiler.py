@@ -11,6 +11,7 @@ import sys
 from contextlib import contextmanager
 
 from ezio.astutil.node_visitor import NodeVisitor
+from ezio.constants import CURRENT_METHOD_TAG
 
 
 DISPLAY_NAME = "display"
@@ -38,12 +39,44 @@ CMPOP_TO_OPID = {
         _ast.GtE: 'Py_GE',
 }
 
+UNARYOP_TO_CAPI = {
+        _ast.Invert: 'PyNumber_Invert',
+        _ast.USub: 'PyNumber_Negative',
+        _ast.UAdd: 'PyNumber_Positive',
+        _ast.Not: 'unary_not',
+}
+
+BINARYOP_TO_CAPI = {
+        _ast.Add: 'PyNumber_Add',
+        _ast.Sub: 'PyNumber_Subtract',
+        _ast.Mult: 'PyNumber_Multiply',
+        _ast.Div: 'PyNumber_Divide',
+        _ast.Mod: 'PyNumber_Remainder',
+        _ast.Pow: 'PyNumber_Power',
+        _ast.LShift: 'PyNumber_Lshift',
+        _ast.RShift: 'PyNumber_Rshift',
+        _ast.BitOr: 'PyNumber_Or',
+        _ast.BitAnd: 'PyNumber_And',
+        _ast.BitXor: 'PyNumber_Xor',
+        _ast.FloorDiv: 'PyNumber_FloorDivide',
+}
+
 # Python built-in objects to their names in the C-API:
 PYBUILTIN_TO_CEXPR = {
         'None': 'Py_None',
         'True': 'Py_True',
         'False': 'Py_False',
 }
+
+class EZIOUnsupportedException(Exception):
+    """Exception type for attempts to use unsupported features of EZIO."""
+    pass
+
+def assert_supported(condition, message=None):
+    """Assert-like convenience for raising EZIOUnsupportedException."""
+    if not condition:
+        exception_args = (message,) if message is not None else ()
+        raise EZIOUnsupportedException(*exception_args)
 
 class CompilerSettings(object):
     """Holds all the switches and the knobs to control compilation."""
@@ -250,36 +283,46 @@ class ImportRegistry(LineBufferMixin):
     def _get_array_accessor(self, index):
         return '%s[%d]' % (IMPORT_ARRAY_NAME, index)
 
-    def register(self, name, asname=None, module=None):
-        """Registers an import.
-        Args:
-            name - desired name to be imported
-                (for "import foo.bar" this is foo.bar, for "from foo.bar import baz" this is baz)
-            asname - name to introduce into the namespace instead of `name`
-            module - for a from import, the base module, i.e.,
-                foo.bar in "from foo.bar import baz"
-        """
-        # FIXME this doesn't cover every case
-        if module:
-            target = "%s.%s" % (module, name)
-        else:
-            target = name
-
+    def make_space(self):
+        """Allocate a place in the import array."""
         index = self.num_objects
-        array_accessor = self._get_array_accessor(index)
-        func_name = 'PyImport_ImportModule'
-        self.imports.append('%s = %s("%s");' % (array_accessor, func_name, target))
-
-        # XXX in Python, the expression foo.bar.baz is "attribute access on foo, then attribute access on the result",
-        # so paths are always resolved from a bare name. We're retaining the possibility of "flattening" accesses
-        # to imported names, so that foo.bar.baz will be statically resolved to a pointer to an imported PyObject*
-        if asname is not None:
-            resolvable_path = (asname,)
-        else:
-            resolvable_path = tuple(name.split('.'))
-
-        self.symbols_to_index[resolvable_path] = index
         self.num_objects += 1
+        return index, self._get_array_accessor(index)
+
+    def register_import(self, module, asname=None):
+        """Register a normal import statement, e.g., `import a.b.c`, `import a.b.c. as d`."""
+        index, accessor = self.make_space()
+        if not asname:
+            self.imports.append('%s = PyImport_ImportModuleEx("%s", NULL, NULL, NULL);'
+                    % (accessor, module))
+            self.imports.append('if (!%s) return;' % (accessor,))
+            # bind the first element of the path
+            # TODO we could "cheat" and bind every subpath
+            resolvable_path = module.split('.')[0]
+            self.symbols_to_index[(resolvable_path,)] = index
+        else:
+            # take a shortcut and just jump to the end of the path
+            # (this corresponds to the trick of __import__(module); sys.modules[module] )
+            self.imports.append('%s = PyImport_ImportModule("%s");' % (accessor, module))
+            self.imports.append('if (!%s) return;' % (accessor,))
+            # bind the as-name:
+            self.symbols_to_index[(asname,)] = index
+
+    def register_fromimport(self, module, fromlist, aslist):
+        """Register a from-import statement, e.g., `from a.b import c, d as e`."""
+        _index, accessor = self.make_space()
+
+        packed_fromlist = ', '.join(['PyString_FromString("%s")' % (item,) for item in fromlist])
+        tupled_fromlist = 'PyTuple_Pack(%d, %s)' % (len(fromlist), packed_fromlist)
+        self.imports.append('%s = PyImport_ImportModuleEx("%s", NULL, NULL, %s);' %
+                (accessor, module, tupled_fromlist))
+
+        for fromname, asname in zip(fromlist, aslist):
+            from_index, from_accessor = self.make_space()
+            self.imports.append('%s = PyObject_GetAttr(%s, PyString_FromString("%s"));' %
+                    (from_accessor, accessor, fromname))
+            self.imports.append('if (!%s) return;' % (from_accessor,))
+            self.symbols_to_index[(asname or fromname,)] = from_index
 
     def resolve_import_path(self, path):
         """Produces the C-language expression corresponding to an import path, or None."""
@@ -442,7 +485,7 @@ class ClassDefinition(LineBufferMixin):
         self.add_line('public:')
 
         # generate a call to the superclass constructor
-        constructor_args = "PyObject *display, PyObject *transaction, PyObject *self_ptr";
+        constructor_args = "PyObject *display, PyObject *transaction, PyObject *self_ptr"
         superclass_constructor_call = "%s(display, transaction, self_ptr)" % (superclass_name,)
         self.add_line('%s (%s) : %s {}' % (self.class_name, constructor_args,
             superclass_constructor_call,))
@@ -581,6 +624,18 @@ def generate_c_file(module_name, literal_registry, path_registry, import_registr
 
     return '\n'.join(cpp_file.get_lines())
 
+class NameStatus(object):
+    """Encapsulates the status of a name we have compile-time information about."""
+
+    def __init__(self, accessor='NATIVE', scope='ARGUMENT', null=False, owned_ref=False):
+        # how do we access this name? e.g., 'NATIVE', 'SELF'
+        self.accessor = accessor
+        # what's the C scope of this name? only really relevant for 'NATIVE'
+        self.scope = scope
+        # does this require a NULL test before use?
+        self.null = null
+        # do we own a reference to this name?
+        self.owned_ref = owned_ref
 
 class CodeGenerator(LineBufferMixin, NodeVisitor):
     """
@@ -603,7 +658,13 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
     could result in all those references being removed and the object being freed.
 
     self.exception_handler_stack[-1] should contain a label that can be jumped to
-    to fall all the way down the call stack and back into Python.
+    to fall all the way down the call stack and back into Python. Every code generation
+    method is responsible for generating its own error handling, i.e., if you do:
+
+        self.visit(subexpression, variable_name=tempvar)
+
+    you don't have to perform a NULL test on `tempvar` afterwards, since that's
+    the responsibility of the visitor you invoked.
     """
 
     def __init__(self, class_definition=None, literal_registry=None, path_registry=None,
@@ -729,6 +790,7 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
             self._template_write(literal_reference)
 
     def visit_FunctionDef(self, function_def, method=False):
+        self.function_def_name = function_def.name
         argslist_str, arg_namespace = self._generate_argslist_for_declaration(function_def.args, method=method)
         self.add_line("PyObject* %s::%s(%s) {" % (self.class_definition.class_name, function_def.name, argslist_str))
         self.indent += 1
@@ -750,6 +812,7 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         # semantics; a local variable is scoped to its enclosing function, not to any smaller
         # block.
         self.assignment_targets = LineBufferMixin()
+        self.assignment_cleanup = LineBufferMixin()
         self.assignment_namespace = {}
         self.add_fixup(self.assignment_targets)
         self.namespaces.append(self.assignment_namespace)
@@ -762,9 +825,13 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         self.namespaces.append(arg_namespace)
         for stmt in function_def.body:
             self.visit(stmt)
+        # insert the fixup to clean up assignments
+        self.add_fixup(self.assignment_cleanup)
         # XXX Py_None is being used as a C-truthy sentinel for success
         self.add_line("return Py_None;")
         self.add_line('%s:' % exception_handler)
+        # insert the cleanup fixup *again*
+        self.add_fixup(self.assignment_cleanup)
         self.add_line("return NULL;")
         self.indent -= 1
         # remove the argument and assignment namespaces:
@@ -792,12 +859,14 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         defined_args = ["PyObject *%s" % name for name in positional_args]
         argslist_str = ", ".join(defined_args)
 
-        # these names can be resolved "natively", i.e., they're in the C namespace
-        namespace = dict((argname, 'NATIVE') for argname in positional_args)
+        namespace = {}
+        for argname in positional_args:
+            namespace[argname] = NameStatus(accessor='NATIVE', scope='ARGUMENT',
+                    null=False, owned_ref=False)
         # this name can be resolved to this->self_ptr (with a NULL test);
         # in specialized contexts, attribute accesses on it can be resolved to native code
         if self_arg is not None:
-            namespace[self_arg] = 'SELF'
+            namespace[self_arg] = NameStatus(accessor='SELF')
         return argslist_str, namespace
 
     def _generate_argslist_for_invocation(self, call_node, c_method):
@@ -929,12 +998,29 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         if isinstance(func_node, _ast.Name):
             function_name = func_node.id
             c_method = self.class_definition.get_method(function_name)
-        # or else a reference to self.asdf where 'asdf' appears in the class definition as a method:
         elif isinstance(func_node, _ast.Attribute):
-            if (isinstance(func_node.value, _ast.Name)
-                and self._get_name_status(func_node.value.id) == 'SELF'):
-                function_name = func_node.attr
-                c_method = self.class_definition.get_method(function_name)
+            value_node = func_node.value
+            # or else a reference to self.asdf where 'asdf' appears in the class definition as a method:
+            if isinstance(value_node, _ast.Name):
+                name_status = self._get_name_status(func_node.value.id)
+                if name_status and name_status.accessor == 'SELF':
+                    function_name = func_node.attr
+                    c_method = self.class_definition.get_method(function_name)
+            # or else super(X, self).y():
+            # XXX this ignores the case of dispatch to a class other than the immediate superclass,
+            # but that's all the functionality Cheetah's #super directive provides anyway.
+            elif (isinstance(value_node, _ast.Call) and isinstance(value_node.func, _ast.Name)
+                    and value_node.func.id == 'super' and self._get_name_status('super') is None):
+                assert_supported(self.compiler_settings.template_mode,
+                        'super() not fully implemented')
+                # function we're trying to call is the `y` in super(X, self).y():
+                superclass_function_name = func_node.attr
+                if superclass_function_name == CURRENT_METHOD_TAG:
+                    superclass_function_name = self.function_def_name
+                c_method = self.superclass_definition.get_method(superclass_function_name)
+                assert c_method, 'No superclass method available.'
+                function_name = '%s::%s' % \
+                        (self.superclass_definition.class_name, superclass_function_name)
 
         if not c_method and call_node.keywords:
             return self._visit_Call_dynamic_kwargs(call_node, variable_name=variable_name)
@@ -1114,16 +1200,16 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         self.add_line("if (!%s) { goto %s; }" % (var_name, outer_exception_handler))
         # GET_ITEM borrowed a reference, let's incref this thing while we're using it
         self.add_line("Py_INCREF(%s);" % var_name)
-        self.namespaces.append({var_name: 'NATIVE'})
-        self.exception_handler_stack.append(inner_exception_handler)
+
+        inner_namespace = {
+            var_name: NameStatus(accessor='NATIVE', scope='LOCAL', null=False, owned_ref=True)
+        }
 
         # compile the body of the for loop
-        # TODO assignment statements will necessitate scoping that will spill outside of this:
-        for stmt in forloop.body:
-            self.visit(stmt)
-
-        self.exception_handler_stack.pop()
-        self.namespaces.pop()
+        with self.additional_namespace(inner_namespace):
+            with self.additional_exception_handler(inner_exception_handler):
+                for stmt in forloop.body:
+                    self.visit(stmt)
 
         # decref the item we got from the list and incref'ed above:
         self.add_line("Py_DECREF(%s);" % var_name)
@@ -1193,17 +1279,19 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         self.indent -= 1
         self.add_line('}')
 
-    def _template_write(self, cexpr):
+    def _template_write(self, cexpr, newref=False):
         """Write a C expression to the transaction.
 
         Args:
             cexpr - C expression to write
-            test_null - check the value for nullness first
+            newref - remove the new reference that was created
         """
         if not self.compiler_settings.template_mode:
             return
 
         self.add_line("PyList_Append(this->%s, %s);" % (TRANSACTION_NAME, cexpr))
+        if newref:
+            self.add_line('Py_DECREF(%s);' % (cexpr,))
 
     def _make_tempvar(self, prefix=None):
         """Get a temporary variable with a unique name."""
@@ -1290,16 +1378,16 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         if name_status is None:
             return None
 
-        if name_status == 'NATIVE':
+        if name_status.accessor == 'NATIVE' and not name_status.null:
             return name
 
-        if name_status == 'SMART_POINTER':
+        if name_status.accessor == 'NATIVE' and name_status.null:
             # generate a NameError for uninitialized use of a #set variable:
-            self.add_line('if (!%s.referent) { PyErr_SetString(PyExc_NameError, "%s"); goto %s; }' %
+            self.add_line('if (!%s) { PyErr_SetString(PyExc_NameError, "%s"); goto %s; }' %
                 (name, name, self.exception_handler_stack[-1]))
-            return '%s.referent' % (name,)
+            return name
 
-        if name_status == 'SELF':
+        if name_status.accessor == 'SELF':
             # generate a NameError if we have no wrapped object:
             error_msg = 'No wrapped object to resolve the self-name %s' % (name,)
             self.add_line('if (!this->self_ptr) { PyErr_SetString(PyExc_NameError, "%s"); goto %s; }' %
@@ -1309,7 +1397,7 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         raise Exception("Can't process name %s with unsupported status %s" % (name, name_status,))
 
     def _get_name_status(self, name):
-        """Gets the status, e.g., 'NATIVE', 'SMART_POINTER', of a name that can be resolved natively.
+        """Gets the NameStatus object for a name we have compile-time information about.
         """
         for namespace in reversed(self.namespaces):
             if name in namespace:
@@ -1375,9 +1463,8 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
                 # path lookup returns a new ref
                 return True
             else:
-                self._template_write(result_var)
-                # dispose of the extra ref:
-                self.add_line("Py_DECREF(%s);" % (result_var,))
+                # write and dispose of the extra ref
+                self._template_write(result_var, newref=True)
 
     def visit_Import(self, import_node, variable_name=None):
         """e.g., "import os", "import os.path".
@@ -1387,15 +1474,17 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         """
         assert variable_name is None, 'Not an expression.'
         for alias_node in import_node.names:
-            self.import_registry.register(alias_node.name, asname=alias_node.asname)
+            self.import_registry.register_import(alias_node.name, asname=alias_node.asname)
 
     def visit_ImportFrom(self, import_node, variable_name=None):
         """e.g., "from foo import bar", "from foo.bar import baz, bat"
         """
         assert variable_name is None, 'Not an expression.'
         assert import_node.level == 0, 'Explicit relative imports unsupported.'
-        for alias_node in import_node.names:
-            self.import_registry.register(alias_node.name, asname=alias_node.asname, module=import_node.module)
+
+        fromnames = [alias.name for alias in import_node.names]
+        asnames = [alias.asname for alias in import_node.names]
+        self.import_registry.register_fromimport(import_node.module, fromnames, asnames)
 
     def visit_If(self, if_node, variable_name=None):
         """Compile an if statement."""
@@ -1431,6 +1520,62 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
                     for stmt in if_node.orelse:
                         self.visit(stmt)
                 self.add_line("}")
+
+    def visit_IfExp(self, if_node, variable_name=None):
+        """Compile a if expression, i.e., `expr if test else otherexpr`.
+
+        Regrettably largely copied and pasted from visit_If.
+        """
+        with self.block_scope():
+            if not variable_name:
+                target = self._make_tempvar()
+                self.add_line('PyObject *%s;' % (target,))
+            else:
+                target = variable_name
+
+            # hold the C boolean status of the conditional:
+            conditional_tempvar = self._make_tempvar(prefix='conditional')
+            self.add_line("int %s;" % (conditional_tempvar,))
+
+            if isinstance(if_node.test, _ast.BoolOp):
+                self.visit_BoolOp(if_node.test, variable_name=None, boolean_name=conditional_tempvar)
+            else:
+                conditional_expr = self._make_tempvar(prefix='conditional_expr')
+                self.add_line("PyObject *%s;" % (conditional_expr,))
+                new_ref = self.visit(if_node.test, variable_name=conditional_expr)
+                self._truth_test(conditional_expr, conditional_tempvar, new_ref)
+                # we don't need the Python object for the conditional anymore:
+                if new_ref:
+                    self.add_line("Py_DECREF(%s);" % (conditional_expr,))
+
+            incref_fixup_1 = LineBufferMixin(initial_indent=self.indent)
+            incref_fixup_2 = LineBufferMixin(initial_indent=self.indent)
+            target_incref = 'Py_INCREF(%s);' % (target,)
+            # now generate C++ if and else statements:
+            self.add_line("if (%s) {" % (conditional_tempvar,))
+            with self.increased_indent():
+                newref_1 = self.visit(if_node.body, variable_name=target)
+                self.add_fixup(incref_fixup_1)
+            self.add_line("}")
+            self.add_line("else {")
+            with self.increased_indent():
+                newref_2 = self.visit(if_node.orelse, variable_name=target)
+                self.add_fixup(incref_fixup_2)
+            self.add_line("}")
+
+            # if one of the branches creates a new reference and the other doesn't,
+            # make the other one do an INCREF, so the reference creation is the same
+            # on all code paths.
+            if newref_1 and not newref_2:
+                incref_fixup_2.add_line(target_incref)
+            elif newref_2 and not newref_1:
+                incref_fixup_1.add_line(target_incref)
+
+            newref = newref_1 or newref_2
+            if not variable_name:
+                self._template_write(target, newref=newref)
+            else:
+                return newref
 
     def _truth_test(self, variable_target, boolean_target, new_ref):
         """Get the Python truth value of an object, with error checking."""
@@ -1579,27 +1724,42 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
 
     def visit_UnaryOp(self, unary_op_node, variable_name=None):
         """Compile a unary operation."""
-        assert isinstance(unary_op_node.op, _ast.Not), 'Right now, "not" is the only supported unary operator.'
+        unary_not = isinstance(unary_op_node.op, _ast.Not)
+        capi_call = UNARYOP_TO_CAPI.get(type(unary_op_node.op))
 
         with self.block_scope():
-            boolean_target = self._make_tempvar()
-            self.add_line("int %s = -1;" % (boolean_target,))
             if variable_name is not None:
                 variable_target = variable_name
             else:
                 variable_target = self._make_tempvar()
-                self._declare_and_initialize([variable_target])
+                self.add_line('PyObject *%s;' % (variable_target,))
 
-            new_ref = self.visit(unary_op_node.operand, variable_name=variable_target)
-            self._truth_test(variable_target, boolean_target, new_ref)
-            # we don't need the operand:
-            if new_ref:
-                self.add_line("Py_DECREF(%s);" % (variable_target,))
-            # negate the value of boolean_target:
-            self.add_line("%s = (%s) ? Py_False : Py_True;" % (variable_target, boolean_target,))
+            operand_tempvar = self._make_tempvar()
+            self.add_line('PyObject *%s;' % (operand_tempvar,))
+            # compute the operand
+            operand_newref = self.visit(unary_op_node.operand, variable_name=operand_tempvar)
+            # now apply the unary op
+            self.add_line('%s = %s(%s);' % (variable_target, capi_call, operand_tempvar))
+            # if we have a new ref to the operand, get rid of it now
+            if operand_newref:
+                self.add_line('Py_DECREF(%s);' % (operand_tempvar,))
+            # test for failure of the unary operation:
+            self.add_line('if (!%s) { goto %s; }' %
+                    (variable_target, self.exception_handler_stack[-1]))
+
+            # our unary_not implementation returns a borrowed reference;
+            # all the others return new references
+            newref = not unary_not
             if variable_name:
-                # return a borrowed ref to Py_True or Py_False:
-                return False
+                return newref
+            else:
+                self._template_write(variable_target, newref=newref)
+
+    def visit_BinOp(self, binary_op_node, variable_name=None):
+        """Compile a binary operation."""
+        capi_call = BINARYOP_TO_CAPI.get(type(binary_op_node.op))
+        self._visit_binary_operation(capi_call, binary_op_node.left, binary_op_node.right,
+                variable_name=variable_name)
 
     def visit_Assign(self, assignment_node, variable_name=None):
         """Compile a #set statement, in its form as a Python assignment."""
@@ -1610,12 +1770,30 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         target_name = target.id
 
         name_status = self._get_name_status(target_name)
-        assert name_status in ('SMART_POINTER', None), 'Cannot assign to a native name.'
 
         if name_status is None:
-            # add a declaration of the requisite smart pointer
-            self.assignment_targets.add_line('PySmartPointer %s;' % (target_name,))
-            self.assignment_namespace[target_name] = 'SMART_POINTER'
+            # this name can be NULL and requires a test before use:
+            target_name_status = NameStatus(accessor='NATIVE', scope='FUNCTION', owned_ref=True,
+                    null=True)
+            # add a declaration of the pointer to the (C function-scoped) assignment_targets fixup:
+            self.assignment_targets.add_line('PyObject *%s = NULL;' % (target_name,))
+            # make the name statically resolvable:
+            self.assignment_namespace[target_name] = target_name_status
+            # conditionally clean up the owned reference to the name
+            self.assignment_cleanup.add_line('Py_XDECREF(%s);' % (target_name,))
+        elif name_status.accessor == 'NATIVE':
+            if not name_status.owned_ref:
+                if name_status.scope == 'ARGUMENT':
+                    # we can promote this argument to be an owned reference
+                    self.assignment_targets.add_line('Py_INCREF(%s);' % (target_name,))
+                    name_status.owned_ref = True
+                    self.assignment_cleanup.add_line('Py_DECREF(%s);' % (target_name,))
+                else:
+                    # FIXME stupid edge case that hopefully no one needs
+                    raise EZIOUnsupportedException("Can't promote non-arguments for assignment.")
+            else:
+                # owned ref, we can just reassign
+                pass
 
         with self.block_scope():
             tempvar = self._make_tempvar()
@@ -1624,7 +1802,7 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
             # smart pointers always contain a new reference:
             if not new_ref:
                 self.add_line('Py_INCREF(%s);' % (tempvar,))
-            self.add_line('%s.set_referent(%s);' % (target_name, tempvar,))
+            self.add_line('Py_XDECREF(%s); %s = %s;' % (target_name, target_name, tempvar,))
 
     def visit_With(self, with_node, variable_name=None):
         """Compile the with statement. See caveats below."""
@@ -1689,7 +1867,8 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
             munged_call_node = copy.deepcopy(call_node)
             call_exception_handler = "HANDLE_EXCEPTIONS_%d" % (self.unique_id_counter.next(),)
             with self.additional_exception_handler(call_exception_handler):
-                with self.additional_namespace({raw_result_tempvar: 'NATIVE'}):
+                name_status = NameStatus(accessor='NATIVE', scope='LOCAL', owned_ref=False, null=False)
+                with self.additional_namespace({raw_result_tempvar: name_status}):
                     fake_arg_node = _ast.Name(id=raw_result_tempvar, ctx=_ast.Load())
                     munged_call_node.args = [fake_arg_node] + call_node.args
                     # compile the call to the postprocessing function, and have it write the result
@@ -1705,6 +1884,117 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
                 self.add_line('Py_DECREF(%s);' % (raw_result_tempvar,))
                 self.add_line("goto %s;" % (self.exception_handler_stack[-1],))
             self.add_line("}")
+
+    def visit_List(self, list_node, variable_name=None):
+        """Compile, e.g., `[1, 2, 3]`."""
+        return self._visit_sequence(list_node, 'list', variable_name=variable_name)
+
+    def visit_Tuple(self, tuple_node, variable_name=None):
+        """Compile, e.g., `(1, 2, 3)."""
+        return self._visit_sequence(tuple_node, 'tuple', variable_name=variable_name)
+
+    def _visit_sequence(self, sequence_node, sequence_type, variable_name=None):
+        if not variable_name:
+            raise EZIOUnsupportedException('Bare sequence without a variable target')
+
+        with self.block_scope():
+            num_items = len(sequence_node.elts)
+            tempvars = [self._make_tempvar() for _ in xrange(num_items)]
+            self._declare_and_initialize(tempvars)
+
+            cleanup_label = "CLEANUP_%d" % (self.unique_id_counter.next())
+            self.exception_handler_stack.append(cleanup_label)
+            newrefs = []
+            for tempvar, elt in zip(tempvars, sequence_node.elts):
+                newrefs.append(self.visit(elt, variable_name=tempvar))
+            self.exception_handler_stack.pop()
+
+            if sequence_type == 'list':
+                builder = 'PyList_New'
+                setter = 'PyList_SET_ITEM'
+            else:
+                builder = 'PyTuple_New'
+                setter = 'PyTuple_SET_ITEM'
+            self.add_line('%s = %s(%d);' % (variable_name, builder, num_items))
+            self.add_line('if (!%s) { goto %s; }' % (variable_name, cleanup_label))
+            for i, (tempvar, newref) in enumerate(zip(tempvars, newrefs)):
+                if not newref:
+                    self.add_line('Py_INCREF(%s);' % (tempvar,))
+                # now steal the new reference to `tempvar` and put it in the tuple:
+                self.add_line('%s(%s, %d, %s);' % (setter, variable_name, i, tempvar))
+
+            self.add_line("if (0) {")
+            with self.increased_indent():
+                self.add_line("%s:" % (cleanup_label,))
+                for tempvar, newref in zip(tempvars, newrefs):
+                    if newref:
+                        self.add_line("Py_XDECREF(%s);" % (tempvar,))
+                self.add_line("goto %s;" % (self.exception_handler_stack[-1],))
+            self.add_line("}")
+
+            return True
+
+    def visit_Subscript(self, subscript_node, variable_name=None):
+        """Compile uses of the bracket operator, e.g., `mydict[mykey]`."""
+        expr_node = subscript_node.value
+        slice_node = subscript_node.slice
+        if not isinstance(slice_node, _ast.Index):
+            raise EZIOUnsupportedException("Can't use slices")
+        index_node = slice_node.value
+        self._visit_binary_operation('optimized_getitem', expr_node, index_node,
+                variable_name=variable_name)
+
+    def _visit_binary_operation(self, capi_call, left_operand, right_operand, variable_name=None):
+        """Evaluate two expressions safely and apply a 2-argument C-API call to them.
+
+        The call in question must return a new reference, and follow the convention of
+        returning NULL on exception and some other value on success.
+        """
+        with self.block_scope():
+            # placeholder for the final result, initialized to NULL
+            # if it's not NULL at the end, we'll know we succeeded
+            if variable_name is not None:
+                variable_target = variable_name
+                self.add_line('%s = NULL;' % (variable_target,))
+            else:
+                variable_target = self._make_tempvar()
+                self._declare_and_initialize([variable_target])
+
+            left_tempvar, right_tempvar = self._make_tempvar(), self._make_tempvar()
+            self.add_line('PyObject *%s;' % (left_tempvar,))
+            self.add_line('PyObject *%s = NULL;' % (right_tempvar,))
+
+            # if this fails we'll bail out to some other handler:
+            left_newref = self.visit(left_operand, variable_name=left_tempvar)
+            # but now we own a ref, so compile with a cleanup handler:
+            cleanup_handler = "CLEANUP_%d" % (self.unique_id_counter.next(),)
+            with self.additional_exception_handler(cleanup_handler):
+                right_newref = self.visit(right_operand, variable_name=right_tempvar)
+                # now apply the binary op
+                self.add_line('%s = %s(%s, %s);' %
+                        (variable_target, capi_call, left_tempvar, right_tempvar))
+
+            self.add_line('%s:' % (cleanup_handler,))
+            # this operation must have succeeded:
+            if left_newref:
+                self.add_line('Py_DECREF(%s);' % (left_tempvar))
+            # but this one may have failed:
+            if right_newref:
+                self.add_line('Py_XDECREF(%s);' % (right_tempvar))
+            # if we failed to compute either operand, or the final result:
+            self.add_line('if (!%s) { goto %s; }' %
+                    (variable_target, self.exception_handler_stack[-1]))
+
+            # either return the result or write it
+            # (we required the C-API call to return a new reference)
+            if variable_name:
+                return True
+            else:
+                self._template_write(variable_target, newref=True)
+
+    def visit_Pass(self, _pass_node, variable_name=None):
+        """Compile the pass statement."""
+        assert not variable_name, 'Pass is not an expression.'
 
     def run(self, module_name, parsetree):
         """

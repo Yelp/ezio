@@ -32,9 +32,7 @@ class TestCase(EZIOTestCase):
     def test(self):
         super(TestCase, self).test()
 
-        # split by newline, ignoring blank lines:
-        split_result = [line for line in self.result.split('\n') if line]
-        assert_equal(split_result,
+        assert_equal(self.lines,
                 ['<div>', 'hi from baltimore', '</div>',
                  '<p>', "to king's landing!", '</p>'])
 

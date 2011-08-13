@@ -44,7 +44,7 @@ class SimpleTestCase(EZIOTestCase):
         # note that 'asdf' == u'asdf', so we don't need to explicitly prefix the
         # literals here with u:
         assert_equal(
-            self.result.strip().split('\n'),
+            self.lines,
             ['first', '1', 'second', '2.0', 'third', 'asdf', 'fourth', 'ohaiunicode',
              'fifth', u'hommage \xe0 jack'
             ]
