@@ -45,6 +45,7 @@ class TestCase(EZIOTestCase):
                 DEFAULT_ARGUMENT,
                 'this is the second call to my_func',
         ]
+        assert_equal(self.lines, expected_lines)
 
 if __name__ == '__main__':
     testify.run()

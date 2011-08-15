@@ -47,6 +47,32 @@ static PyObject *resolve_path(PyObject *base, Py_ssize_t path_length, ...) {
     return base;
 }
 
+/** Helper for tuple unpacking; copy the internal buffer of a list or tuple
+  into a destination array, checking the size against `len`, and setting
+  appropriate exceptions on failure. Returns 0 on failure and 1 on success.
+  */
+static int sequence_copy(PyObject *seq, Py_ssize_t len, PyObject **dest) {
+    if (PyList_Check(seq)) {
+        if (PyList_GET_SIZE(seq) != len) {
+            PyErr_SetString(PyExc_ValueError, "Invalid sequence size");
+            return 0;
+        }
+        // copy the internal buffer
+        memcpy(dest, ((PyListObject *) seq)->ob_item, sizeof(PyObject *) * len);
+        return 1;
+    } else if (PyTuple_Check(seq)) {
+        if (PyTuple_GET_SIZE(seq) != len) {
+            PyErr_SetString(PyExc_ValueError, "Invalid sequence size");
+            return 0;
+        }
+        memcpy(dest, ((PyTupleObject *) seq)->ob_item, sizeof(PyObject *) * len);
+        return 1;
+    }
+
+    PyErr_SetString(PyExc_TypeError, "Cannot unpack non-list/tuple.");
+    return 0;
+}
+
 namespace ezio_templates {
 
     /** Base C++ class for all templates. */

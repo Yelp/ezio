@@ -627,7 +627,8 @@ def generate_c_file(module_name, literal_registry, path_registry, import_registr
 class NameStatus(object):
     """Encapsulates the status of a name we have compile-time information about."""
 
-    def __init__(self, accessor='NATIVE', scope='ARGUMENT', null=False, owned_ref=False):
+    def __init__(self, accessor='NATIVE', scope='ARGUMENT', null=False, owned_ref=False,
+            cexpr=None):
         # how do we access this name? e.g., 'NATIVE', 'SELF'
         self.accessor = accessor
         # what's the C scope of this name? only really relevant for 'NATIVE'
@@ -636,6 +637,8 @@ class NameStatus(object):
         self.null = null
         # do we own a reference to this name?
         self.owned_ref = owned_ref
+        # C expression for accessing the contents of this variable
+        self.cexpr = cexpr
 
 class CodeGenerator(LineBufferMixin, NodeVisitor):
     """
@@ -862,7 +865,7 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         namespace = {}
         for argname in positional_args:
             namespace[argname] = NameStatus(accessor='NATIVE', scope='ARGUMENT',
-                    null=False, owned_ref=False)
+                    null=False, owned_ref=False, cexpr=argname)
         # this name can be resolved to this->self_ptr (with a NULL test);
         # in specialized contexts, attribute accesses on it can be resolved to native code
         if self_arg is not None:
@@ -1156,6 +1159,42 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         if variable_name:
             return True
 
+    def _unpack_tuple(self, tuple_var, tuple_node, cleanup_handler):
+        temp_array = self._make_tempvar()
+        temp_array_declaration = LineBufferMixin(initial_indent=self.indent)
+        self.add_fixup(temp_array_declaration)
+        reassignment_fixup = LineBufferMixin(initial_indent=self.indent)
+
+        index = 0
+        cexpr_and_tuple = [(tuple_var, tuple_node)]
+        while cexpr_and_tuple:
+            cexpr, tuple_node = cexpr_and_tuple.pop()
+            tuple_len = len(tuple_node.elts)
+            self.add_line('if (!sequence_copy(%s, %d, %s + %d)) { goto %s; }' %
+                    (cexpr, tuple_len, temp_array, index, cleanup_handler))
+
+            for i, elt in enumerate(tuple_node.elts):
+                current_elt_cexpr = '%s[%d]' % (temp_array, index + i)
+                if isinstance(elt, _ast.Name):
+                    # set this up as a function-scoped variable with an owned reference
+                    assignment_lvalue = self._get_assignment_lvalue(elt.id)
+                    # right now, INCREF the item, protecting it against destruction
+                    self.add_line('Py_INCREF(%s);' % (current_elt_cexpr,))
+                    # in the future, steal the newly created reference into the function-scoped var
+                    reassignment_fixup.add_line('Py_XDECREF(%s); %s = %s;' % (assignment_lvalue,
+                        assignment_lvalue, current_elt_cexpr,))
+                elif isinstance(elt, _ast.Tuple):
+                    # push this tuple on the stack to be unpacked
+                    cexpr_and_tuple.append((current_elt_cexpr, elt))
+                else:
+                    # can't happen
+                    raise ValueError(type(elt))
+
+            index += tuple_len
+
+        temp_array_declaration.add_line('PyObject *%s[%d];' % (temp_array, index))
+        self.add_fixup(reassignment_fixup)
+
     def visit_For(self, forloop, variable_name=None):
         """Compile a for loop, block-scoped.
         TODO the temporary variable is scoped to the inside of the for loop; this violates Python semantics
@@ -1163,25 +1202,30 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         """
         assert variable_name is None, 'For loops are not expressions'
         assert not forloop.orelse, 'Cannot compile else block of for loop'
+
+        unpack_tuple = False
+        if isinstance(forloop.target, _ast.Name):
+            element_varname = forloop.target.id
+        elif isinstance(forloop.target, _ast.Tuple):
+            element_varname = self._make_tempvar()
+            unpack_tuple = True
+        else:
+            raise EZIOUnsupportedException('Unrecognized for-loop target', type(forloop.target))
+
         # block-scope the whole thing, to prevent C++ complaining about jumps over initialization statements
         self.add_line()
         self.add_line('{')
 
-        # target (i.e., the temporary variable) is an expr, which for us must be a Name, whose actual name is in the id member
-        # TODO we could support tuple unpacking here
-        assert isinstance(forloop.target, _ast.Name), 'For-loop target must be a name'
-        var_name = forloop.target.id
-
         unique_id = self.unique_id_counter.next()
-        inner_exception_handler = "INNER_HANDLE_EXCEPTIONS_%d" % unique_id
+        inner_exception_handler = "INNER_HANDLE_EXCEPTIONS_%d" % (unique_id,)
         # handles exceptions inside the loop
-        outer_exception_handler = "OUTER_HANDLE_EXCEPTIONS_%d" % unique_id
+        outer_exception_handler = "OUTER_HANDLE_EXCEPTIONS_%d" % (unique_id,)
 
-        temp_sequence_name = 'temp_sequence_%d' % unique_id
-        temp_fast_sequence_name = "temp_fast_sequence_%d" % unique_id
+        temp_sequence_name = 'temp_sequence_%d' % (unique_id,)
+        temp_fast_sequence_name = "temp_fast_sequence_%d" % (unique_id,)
         self.add_line('PyObject *%s, *%s = NULL;' % (temp_sequence_name, temp_fast_sequence_name))
-        length_name = "temp_sequence_length_%d" % unique_id
-        self.add_line("Py_ssize_t %s;" % length_name)
+        length_name = "temp_sequence_length_%d" % (unique_id,)
+        self.add_line("Py_ssize_t %s;" % (length_name,))
 
         self.exception_handler_stack.append(outer_exception_handler)
         new_ref_created_for_iterable = self.visit(forloop.iter, variable_name=temp_sequence_name)
@@ -1196,14 +1240,18 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
 
         self.indent += 1
         self.add_line("PyObject *%s = PySequence_Fast_GET_ITEM(%s, %s);" %
-            (var_name, temp_fast_sequence_name, counter_name))
-        self.add_line("if (!%s) { goto %s; }" % (var_name, outer_exception_handler))
+            (element_varname, temp_fast_sequence_name, counter_name))
         # GET_ITEM borrowed a reference, let's incref this thing while we're using it
-        self.add_line("Py_INCREF(%s);" % var_name)
+        self.add_line("Py_INCREF(%s);" % element_varname)
 
-        inner_namespace = {
-            var_name: NameStatus(accessor='NATIVE', scope='LOCAL', null=False, owned_ref=True)
-        }
+        if unpack_tuple:
+            self._unpack_tuple(element_varname, forloop.target, inner_exception_handler)
+            inner_namespace = {}
+        else:
+            inner_namespace = {
+                element_varname: NameStatus(accessor='NATIVE', scope='LOCAL', null=False, owned_ref=True,
+                    cexpr=element_varname)
+            }
 
         # compile the body of the for loop
         with self.additional_namespace(inner_namespace):
@@ -1212,13 +1260,13 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
                     self.visit(stmt)
 
         # decref the item we got from the list and incref'ed above:
-        self.add_line("Py_DECREF(%s);" % var_name)
+        self.add_line("Py_DECREF(%s);" % (element_varname,))
 
         # inner exception handler: decref the temporary variable name:
         self.add_line("if (0) {")
         self.indent += 1
         self.add_line('%s:' % inner_exception_handler)
-        self.add_line('Py_DECREF(%s);' % var_name)
+        self.add_line('Py_DECREF(%s);' % (element_varname,))
         # defer remaining cleanup to the outer exception handler
         self.add_line('goto %s;' % outer_exception_handler)
         self.indent -= 1
@@ -1379,13 +1427,13 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
             return None
 
         if name_status.accessor == 'NATIVE' and not name_status.null:
-            return name
+            return name_status.cexpr
 
         if name_status.accessor == 'NATIVE' and name_status.null:
             # generate a NameError for uninitialized use of a #set variable:
             self.add_line('if (!%s) { PyErr_SetString(PyExc_NameError, "%s"); goto %s; }' %
-                (name, name, self.exception_handler_stack[-1]))
-            return name
+                (name_status.cexpr, name, self.exception_handler_stack[-1]))
+            return name_status.cexpr
 
         if name_status.accessor == 'SELF':
             # generate a NameError if we have no wrapped object:
@@ -1761,24 +1809,17 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         self._visit_binary_operation(capi_call, binary_op_node.left, binary_op_node.right,
                 variable_name=variable_name)
 
-    def visit_Assign(self, assignment_node, variable_name=None):
-        """Compile a #set statement, in its form as a Python assignment."""
-        assert not variable_name, 'Assignments are not expressions.'
-        assert len(assignment_node.targets) == 1, 'Tuple unpacking is unsupported.'
-        target = assignment_node.targets[0]
-        assert isinstance(target, _ast.Name), 'Assign to non-names is unsupported.'
-        target_name = target.id
-
+    def _get_assignment_lvalue(self, target_name):
         name_status = self._get_name_status(target_name)
 
         if name_status is None:
             # this name can be NULL and requires a test before use:
-            target_name_status = NameStatus(accessor='NATIVE', scope='FUNCTION', owned_ref=True,
-                    null=True)
+            name_status = NameStatus(accessor='NATIVE', scope='FUNCTION', owned_ref=True,
+                    null=True, cexpr=target_name)
             # add a declaration of the pointer to the (C function-scoped) assignment_targets fixup:
             self.assignment_targets.add_line('PyObject *%s = NULL;' % (target_name,))
             # make the name statically resolvable:
-            self.assignment_namespace[target_name] = target_name_status
+            self.assignment_namespace[target_name] = name_status
             # conditionally clean up the owned reference to the name
             self.assignment_cleanup.add_line('Py_XDECREF(%s);' % (target_name,))
         elif name_status.accessor == 'NATIVE':
@@ -1794,15 +1835,40 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
             else:
                 # owned ref, we can just reassign
                 pass
+        else:
+            raise EZIOUnsupportedException("Assignment to invalid target", name_status.accessor)
+
+        return name_status.cexpr
+
+    def visit_Assign(self, assignment_node, variable_name=None):
+        """Compile a #set statement, in its form as a Python assignment."""
+        assert not variable_name, 'Assignments are not expressions.'
+        assert len(assignment_node.targets) == 1, 'Only one assignment per statement is allowed.'
+        target = assignment_node.targets[0]
 
         with self.block_scope():
             tempvar = self._make_tempvar()
             self.add_line("PyObject *%s;" % (tempvar,))
             new_ref = self.visit(assignment_node.value, variable_name=tempvar)
-            # smart pointers always contain a new reference:
-            if not new_ref:
-                self.add_line('Py_INCREF(%s);' % (tempvar,))
-            self.add_line('Py_XDECREF(%s); %s = %s;' % (target_name, target_name, tempvar,))
+
+            if isinstance(target, _ast.Name):
+                lvalue_cexpr = self._get_assignment_lvalue(target.id)
+                # smart pointers always contain a new reference:
+                if not new_ref:
+                    self.add_line('Py_INCREF(%s);' % (tempvar,))
+                self.add_line('Py_XDECREF(%s); %s = %s;' % (lvalue_cexpr, lvalue_cexpr, tempvar,))
+            else:
+                cleanup_handler = "CLEANUP_%d" % (self.unique_id_counter.next(),)
+                self._unpack_tuple(tempvar, target, cleanup_handler)
+                if new_ref:
+                    self.add_line('Py_DECREF(%s);' % (tempvar,))
+                self.add_line('if (0) {')
+                with self.increased_indent():
+                    self.add_line('%s:' % (cleanup_handler,))
+                    if new_ref:
+                        self.add_line('Py_DECREF(%s);' % (tempvar,))
+                    self.add_line('goto %s;' % (self.exception_handler_stack[-1],))
+                self.add_line('}')
 
     def visit_With(self, with_node, variable_name=None):
         """Compile the with statement. See caveats below."""
@@ -1867,7 +1933,8 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
             munged_call_node = copy.deepcopy(call_node)
             call_exception_handler = "HANDLE_EXCEPTIONS_%d" % (self.unique_id_counter.next(),)
             with self.additional_exception_handler(call_exception_handler):
-                name_status = NameStatus(accessor='NATIVE', scope='LOCAL', owned_ref=False, null=False)
+                name_status = NameStatus(accessor='NATIVE', scope='LOCAL', owned_ref=False,
+                        null=False, cexpr=raw_result_tempvar)
                 with self.additional_namespace({raw_result_tempvar: name_status}):
                     fake_arg_node = _ast.Name(id=raw_result_tempvar, ctx=_ast.Load())
                     munged_call_node.args = [fake_arg_node] + call_node.args
