@@ -11,8 +11,7 @@ import sys
 from contextlib import contextmanager
 
 from ezio.astutil.node_visitor import NodeVisitor
-from ezio.constants import CURRENT_METHOD_TAG
-
+from ezio.constants import BUILTIN_MODULE_NAME, BUILTINS_WHITELIST, CURRENT_METHOD_TAG, CompilerSettings
 
 DISPLAY_NAME = "display"
 TRANSACTION_NAME = "transaction"
@@ -61,13 +60,6 @@ BINARYOP_TO_CAPI = {
         _ast.FloorDiv: 'PyNumber_FloorDivide',
 }
 
-# Python built-in objects to their names in the C-API:
-PYBUILTIN_TO_CEXPR = {
-        'None': 'Py_None',
-        'True': 'Py_True',
-        'False': 'Py_False',
-}
-
 class EZIOUnsupportedException(Exception):
     """Exception type for attempts to use unsupported features of EZIO."""
     pass
@@ -77,22 +69,6 @@ def assert_supported(condition, message=None):
     if not condition:
         exception_args = (message,) if message is not None else ()
         raise EZIOUnsupportedException(*exception_args)
-
-class CompilerSettings(object):
-    """Holds all the switches and the knobs to control compilation."""
-
-    # enables use of the variadic path lookup method in Ezio.h,
-    # as opposed to the PathRegistry:
-    use_variadic_path_resolution = False
-
-    # this causes bare expression statements to be written to the
-    # templating transaction, and also enables special template
-    # semantics like dotted path lookup. The idea is that with this on,
-    # the compiler should compile the ASTs from py2moremeaningfulpy,
-    # and with it off, it should be a generalized Python AST compiler
-    # (although clearly most functionality is not implemented yet)
-    template_mode = True
-
 
 class LineBufferMixin(object):
     """Mixin for classes that maintain a collection of indented lines.
@@ -280,6 +256,10 @@ class ImportRegistry(LineBufferMixin):
         self.symbols_to_index = {}
         self.num_objects = 0
 
+        # in every template module, bind names for a subset of the Python builtin functions
+        # (actual import statements encountered later will be able to override these bindings)
+        self.register_fromimport(BUILTIN_MODULE_NAME, BUILTINS_WHITELIST, aslist=None)
+
     def _get_array_accessor(self, index):
         return '%s[%d]' % (IMPORT_ARRAY_NAME, index)
 
@@ -312,11 +292,17 @@ class ImportRegistry(LineBufferMixin):
         """Register a from-import statement, e.g., `from a.b import c, d as e`."""
         _index, accessor = self.make_space()
 
-        packed_fromlist = ', '.join(['PyString_FromString("%s")' % (item,) for item in fromlist])
-        tupled_fromlist = 'PyTuple_Pack(%d, %s)' % (len(fromlist), packed_fromlist)
+        if module == BUILTIN_MODULE_NAME:
+            # avoid creating a huge ugly unneeded tuple
+            tupled_fromlist = 'NULL'
+        else:
+            packed_fromlist = ', '.join(['PyString_FromString("%s")' % (item,) for item in fromlist])
+            tupled_fromlist = 'PyTuple_Pack(%d, %s)' % (len(fromlist), packed_fromlist)
         self.imports.append('%s = PyImport_ImportModuleEx("%s", NULL, NULL, %s);' %
                 (accessor, module, tupled_fromlist))
 
+        if aslist is None:
+            aslist = [None] * len(fromlist)
         for fromname, asname in zip(fromlist, aslist):
             from_index, from_accessor = self.make_space()
             self.imports.append('%s = PyObject_GetAttr(%s, PyString_FromString("%s"));' %
@@ -1365,17 +1351,9 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
         # attempt resolution from a local variable
         cexpr_for_name = self._local_resolve_name(name)
 
+        # resolve from imported names (including builtins)
         if not cexpr_for_name:
-            # TODO this logic should include builtins;
-            # also we'll support some nonstandard builtins
             cexpr_for_name = self._import_resolve_name(name)
-
-        if not cexpr_for_name:
-            cexpr_for_name = self._builtin_resolve_name(name)
-
-        # attempt to resolve the name as an import
-        if not cexpr_for_name:
-            cexpr_for_name = self.import_registry.resolve_import_path((name,))
 
         if not cexpr_for_name:
             if self.compiler_settings.template_mode:
@@ -1451,12 +1429,6 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
             if name in namespace:
                 return namespace[name]
 
-        return None
-
-    def _builtin_resolve_name(self, name):
-        if name in PYBUILTIN_TO_CEXPR:
-            return PYBUILTIN_TO_CEXPR[name]
-        # TODO support all builtins
         return None
 
     def _import_resolve_name(self, name):
