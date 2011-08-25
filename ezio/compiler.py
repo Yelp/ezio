@@ -1973,6 +1973,38 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
 
             return True
 
+    def visit_Dict(self, dict_node, variable_name=None):
+        if not variable_name:
+            raise EZIOUnsupportedException('Bare dict without a variable target')
+
+        self.add_line('if (!(%s = PyDict_New())) { goto %s; }' %
+                (variable_name, self.exception_handler_stack[-1]))
+
+        with self.block_scope():
+            key_tempvar, value_tempvar = self._make_tempvar(), self._make_tempvar()
+            self._declare_and_initialize([key_tempvar, value_tempvar])
+            cleanup_handler = "CLEANUP_%d" % (self.unique_id_counter.next(),)
+            with self.additional_exception_handler(cleanup_handler):
+                for key, value in zip(dict_node.keys, dict_node.values):
+                    key_newref = self.visit(key, variable_name=key_tempvar)
+                    self.add_line('if (!%s) { goto %s; }' % (key_tempvar, cleanup_handler))
+                    value_newref = self.visit(value, variable_name=value_tempvar)
+                    self.add_line('if (!%s) { goto %s; }' % (value_tempvar, cleanup_handler))
+                    self.add_line('if (PyDict_SetItem(%s, %s, %s) == -1) { goto %s; }' %
+                            (variable_name, key_tempvar, value_tempvar, cleanup_handler))
+                    if key_newref:
+                        self.add_line('Py_DECREF(%s);' % (key_tempvar,))
+                    if value_newref:
+                        self.add_line('Py_DECREF(%s);' % (value_tempvar,))
+
+            self.add_line("if (0) {")
+            self.add_line("%s:" % (cleanup_handler,))
+            self.add_line("Py_DECREF(%s);" % (variable_name,))
+            self.add_line("goto %s;" % (self.exception_handler_stack[-1],))
+            self.add_line("}")
+
+        return True
+
     def visit_Subscript(self, subscript_node, variable_name=None):
         """Compile uses of the bracket operator, e.g., `mydict[mykey]`."""
         expr_node = subscript_node.value

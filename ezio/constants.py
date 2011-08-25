@@ -19,7 +19,7 @@ BUILTIN_MODULE_NAME = '__builtin__'
 BUILTINS_WHITELIST = [
         'None', 'True', 'False', 'len', 'enumerate', 'range', 'xrange', 'list', 'tuple',
         'int', 'str', 'float', 'bool', 'dict', 'set', 'len', 'sum', 'min', 'max', 'any',
-        'all', 'sorted', 'print', 'repr', 'next', 'zip',
+        'all', 'sorted', 'print', 'repr', 'next', 'zip', 'map', 'reduce',
 ]
 
 class CompilerSettings(object):

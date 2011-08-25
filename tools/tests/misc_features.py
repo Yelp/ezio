@@ -49,7 +49,7 @@ class TestCase(EZIOTestCase):
     def test(self):
         super(TestCase, self).test()
         expected_result = ([str(n) for n in xrange(1, 11)] +
-                ['11', 'twelve', '13', 'fourteen', '15'] + ['OK'] * 10)
+                ['11', 'twelve', '13', 'fourteen', '15'] + ['OK'] * 12)
         assert_equal(self.lines, expected_result)
 
 if __name__ == '__main__':

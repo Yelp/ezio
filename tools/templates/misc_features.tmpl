@@ -36,3 +36,7 @@ $("OK" if -one == -1 else "NO")
 $("OK" if 1 + 1 == 2 else "NO")
 ## (this should be an integer division)
 $("NO" if 3/2 == 1.5 else "OK")
+
+#set thedict = {1: 2, 'a': 'b', 'asdf': $ok}
+$("OK" if thedict['a'] == 'b' else "NO")
+$thedict['asdf']
