@@ -1668,12 +1668,12 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
             self.add_line("else { Py_INCREF(%s); }" % (variable_target,))
 
         new_ref = new_ref_1 or new_ref_2
-        if variable_name is None:
-            if new_ref:
-                self.add_line("Py_DECREF(%s);" % (variable_target))
-                self.add_line("}")
-        else:
-            self.add_line("}")
+        if variable_name is None and (new_ref_1 or new_ref_2):
+            # dispose of the unneeded result
+            self.add_line("Py_DECREF(%s);" % (variable_target))
+        self.add_line("}")
+
+        if variable_target is not None:
             return new_ref
 
     def visit_Compare(self, compare_node, variable_name=None):

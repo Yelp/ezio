@@ -51,7 +51,7 @@ class TestCase(EZIOTestCase):
     def test(self):
         super(TestCase, self).test()
 
-        assert_equal(self.result.split(), ['OK'] * 7)
+        assert_equal(self.result.split(), ['OK'] * 8)
         # test that the truth values were accessed only as many times as necessary:
         assert_equal(display['c'].access_count, 0)
         assert_equal(display['d'].access_count, 1)
