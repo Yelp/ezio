@@ -1986,12 +1986,18 @@ class CodeGenerator(LineBufferMixin, NodeVisitor):
             cleanup_handler = "CLEANUP_%d" % (self.unique_id_counter.next(),)
             with self.additional_exception_handler(cleanup_handler):
                 for key, value in zip(dict_node.keys, dict_node.values):
+                    # compute the key and the value
                     key_newref = self.visit(key, variable_name=key_tempvar)
                     self.add_line('if (!%s) { goto %s; }' % (key_tempvar, cleanup_handler))
                     value_newref = self.visit(value, variable_name=value_tempvar)
-                    self.add_line('if (!%s) { goto %s; }' % (value_tempvar, cleanup_handler))
+                    # if we fail to compute the value, destroy the key:
+                    key_decref = 'Py_DECREF(%s)' % (key_tempvar,) if key_newref else ''
+                    self.add_line('if (!%s) { %s; goto %s; }' %
+                            (value_tempvar, key_decref, cleanup_handler))
+                    # stuff them in the dict
                     self.add_line('if (PyDict_SetItem(%s, %s, %s) == -1) { goto %s; }' %
                             (variable_name, key_tempvar, value_tempvar, cleanup_handler))
+                    # now the dict owns references to them; eliminate our own references
                     if key_newref:
                         self.add_line('Py_DECREF(%s);' % (key_tempvar,))
                     if value_newref:
