@@ -5,6 +5,14 @@
 my_func: $local_var
 #end def
 
+## test reassignment to a function argument
+#def my_other_func(arg=None)
+#if arg is None
+#set arg = $get_default_str()
+#end if
+$arg
+#end def
+
 #set local_var = quux
 respond: $local_var
 
@@ -21,3 +29,6 @@ respond_reassignment: $local_var
 ## exercise assignment statements with nontrivial rvalues:
 #set local_var_in_pipes = $add_pipes($local_var)
 in_pipes: $local_var_in_pipes
+
+$my_other_func()
+$my_other_func("this is the second call to my_func")

@@ -1,0 +1,26 @@
+#import os
+
+begin first test
+#for a, b in first_sequence
+$a $b
+#end for
+end first test
+
+begin second test
+#for w, (x, y), z in second_sequence
+$x $z
+#end for
+end second test
+
+begin third test
+#set bar = $get_bar_value
+$bar
+#for bar, baz in third_sequence
+$bar $baz
+#end for
+end third test
+
+begin fourth test
+#set u, v = fourth_sequence
+$u $v
+end fourth test

@@ -1,6 +1,9 @@
 #/usr/bin/python
 
+import sys
+
 import testify
+from testify.assertions import assert_equal
 
 from tools.tests.test_case import EZIOTestCase
 
@@ -24,7 +27,12 @@ class TestCase(EZIOTestCase):
 
     def test(self):
         super(TestCase, self).test()
-        assert 'And the name of this module is: bisect' in self.result
+
+        modules = ['bisect', 'os', 'os', 'os.path', 'email.utils', 'email.errors',
+                'email.mime.image', 'email.mime.image', 'email', 'email.charset',
+                'xml.dom.minidom']
+        files = [sys.modules[module].__file__ for module in modules]
+        assert_equal(self.lines, files)
 
 if __name__ == '__main__':
     testify.run()

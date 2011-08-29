@@ -47,26 +47,31 @@ static PyObject *resolve_path(PyObject *base, Py_ssize_t path_length, ...) {
     return base;
 }
 
-/**
-  Basic RAII for PyObject*'s; store a pointer and a new reference, ensure
-  that the new reference is removed on function exit by putting an XDECREF
-  in the destructor. This is used to implement #set, but not to implement, e.g.,
-  function arguments or the temporary variables in for loops.
- */
-class PySmartPointer {
-    public:
-        // this value can be NULL and always requires a NULL test before use
-        PyObject *referent;
-        PySmartPointer() : referent(NULL) {}
-        PySmartPointer(PyObject *referent) : referent(referent) {}
-        ~PySmartPointer() { Py_XDECREF(referent); }
-        // we could overload the assignment operator here, but we don't really need the magic:
-        // the only value being added here is the destructor.
-        void set_referent(PyObject *new_referent) {
-            Py_XDECREF(referent);
-            referent = new_referent;
+/** Helper for tuple unpacking; copy the internal buffer of a list or tuple
+  into a destination array, checking the size against `len`, and setting
+  appropriate exceptions on failure. Returns 0 on failure and 1 on success.
+  */
+static int sequence_copy(PyObject *seq, Py_ssize_t len, PyObject **dest) {
+    if (PyList_Check(seq)) {
+        if (PyList_GET_SIZE(seq) != len) {
+            PyErr_SetString(PyExc_ValueError, "Invalid sequence size");
+            return 0;
         }
-};
+        // copy the internal buffer
+        memcpy(dest, ((PyListObject *) seq)->ob_item, sizeof(PyObject *) * len);
+        return 1;
+    } else if (PyTuple_Check(seq)) {
+        if (PyTuple_GET_SIZE(seq) != len) {
+            PyErr_SetString(PyExc_ValueError, "Invalid sequence size");
+            return 0;
+        }
+        memcpy(dest, ((PyTupleObject *) seq)->ob_item, sizeof(PyObject *) * len);
+        return 1;
+    }
+
+    PyErr_SetString(PyExc_TypeError, "Cannot unpack non-list/tuple.");
+    return 0;
+}
 
 namespace ezio_templates {
 
@@ -263,4 +268,41 @@ PyObject *ezio_concatenate(PyObject *transaction) {
         PyErr_SetString(PyExc_SystemError, "Invalid coercion status.");
         return NULL;
     }
+}
+
+/**
+  This is equivalent to PyObject_GetItem, but it promotes a common case.
+  Copied and pasted from ceval.c's (i.e., the interpreter's) handling of the
+  BINARY_SUBSCR opcode.
+  */
+PyObject *optimized_getitem(PyObject *expr, PyObject *subscript) {
+    PyObject *x;
+    if (PyList_CheckExact(expr) && PyInt_CheckExact(subscript)) {
+        /* INLINE: list[int] */
+        Py_ssize_t i = PyInt_AsSsize_t(subscript);
+        if (i < 0)
+            i += PyList_GET_SIZE(expr);
+        if (i >= 0 && i < PyList_GET_SIZE(expr)) {
+            x = PyList_GET_ITEM(expr, i);
+            Py_INCREF(x);
+        }
+        else
+            goto slow_get;
+    }
+    else
+        slow_get:
+            x = PyObject_GetItem(expr, subscript);
+    return x;
+}
+
+/**
+  Implement the unary `not` operation as a C-API call returning a borrowed reference.
+  We could explicitly declare this inline if we wanted.
+  */
+PyObject *unary_not(PyObject *expr) {
+    int result = PyObject_IsTrue(expr);
+    if (result == 0) return Py_True;
+    else if (result == 1) return Py_False;
+    // the error condition is -1
+    return NULL;
 }

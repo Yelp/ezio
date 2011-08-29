@@ -47,13 +47,12 @@ class TestCase(EZIOTestCase):
     def test(self):
         super(TestCase, self).test()
 
-        lines = [line for line in self.result.split('\n') if line]
         expected_lines = ['self.bar %s' % (BAR_VALUE,),
                 'self.counter 0',
                 'self.bar still %s' % (BAR_VALUE,),
                 'self.counter now 1',
                 'asdf asdf']
-        assert_equal(lines, expected_lines)
+        assert_equal(self.lines, expected_lines)
 
 if __name__ == '__main__':
     testify.run()

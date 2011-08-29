@@ -7,6 +7,7 @@
     work with.
 """
 
+import _ast
 import ast
 from copy import deepcopy
 
@@ -25,6 +26,8 @@ from _ast import (
     Name,
     Param
 )
+
+from ezio.constants import BLOCK_TAG
 
 def py2moremeaningfulpy(tmpl_name, ast_):
     """Convenience function for using AstGen."""
@@ -166,7 +169,7 @@ class AstGen(object):
 class FunctionDefFlattener(ast.NodeTransformer):
     """Accumulate all function definitions and remove them from the AST. If
     the function definition is tagged as being a #block, leave behind a
-    function call to it.
+    function call to it. Also, interpret EZIO_skip and EZIO_noop.
     """
 
     def __init__(self):
@@ -185,12 +188,28 @@ class FunctionDefFlattener(ast.NodeTransformer):
         # Recurse on children. After this step, the function body is
         # flattened. This order means that the hoisted functions will be in
         # postorder.
+        skip = False
+        noop = False
+
+        # process the magical EZIO_skip and EZIO_noop decorators:
+        for decorator in node.decorator_list:
+            if isinstance(decorator, _ast.Name):
+                if decorator.id == 'EZIO_skip':
+                    skip = True
+                elif decorator.id == 'EZIO_noop':
+                    noop = True
+        if skip:
+            # omit the entire node, without adding it to self.hoisted_defs:
+            return None
+        elif noop:
+            # wipe out the node's body:
+            node.body = [_ast.Pass()]
+
         self.generic_visit(node)
 
-        tag = 'DIRECTIVE__block__'
-        if node.name.startswith(tag): # we're a #block
+        if node.name.startswith(BLOCK_TAG): # we're a #block
 
-            blockname = node.name[len(tag):]
+            blockname = node.name[len(BLOCK_TAG):]
             assert len(blockname) > 0, "a #block must have a name"
 
             # add the def, with name replaced by `blockname`, to
